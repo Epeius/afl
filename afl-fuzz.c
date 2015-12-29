@@ -96,6 +96,7 @@ static u8  skip_deterministic,        /* Skip deterministic stages?       */
            auto_changed,              /* Auto-generated tokens changed?   */
            no_cpu_meter_red,          /* Feng shui on the status screen   */
            no_var_check,              /* Don't detect variable behavior   */
+           shuffle_queue,             /* Shuffle input queue?             */
            bitmap_changed = 1,        /* Time to update bitmap?           */
            qemu_mode,                 /* Running in QEMU mode?            */
            skip_requested,            /* Skip request, via SIGUSR1        */
@@ -335,6 +336,24 @@ static inline u32 UR(u32 limit) {
 }
 
 
+/* Shuffle an array of pointers. Might be slightly biased. */
+
+static void shuffle_ptrs(void** ptrs, u32 cnt) {
+
+  u32 i;
+
+  for (i = 0; i < cnt - 2; i++) {
+
+    u32 j = i + UR(cnt - i);
+    void *s = ptrs[i];
+    ptrs[i] = ptrs[j];
+    ptrs[j] = s;
+
+  }
+
+}
+
+
 #ifndef IGNORE_FINDS
 
 /* Helper function to compare buffers; returns first and last differing offset. We
@@ -533,7 +552,7 @@ static void mark_as_det_done(struct queue_entry* q) {
   fn = alloc_printf("%s/queue/.state/deterministic_done/%s", out_dir, fn + 1);
 
   fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
-  if (fd < 0) PFATAL("Unable to create '%s'", fn);
+  //if (fd < 0) PFATALNONEXIT("Unable to create '%s'", fn);
   close(fd);
 
   ck_free(fn);
@@ -556,7 +575,7 @@ static void mark_as_variable(struct queue_entry* q) {
   if (symlink(ldest, fn)) {
 
     s32 fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) PFATAL("Unable to create '%s'", fn);
+    //if (fd < 0) PFATALNONEXIT("Unable to create '%s'", fn);
     close(fd);
 
   }
@@ -587,12 +606,12 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
   if (state) {
 
     fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) PFATAL("Unable to create '%s'", fn);
+    //if (fd < 0) PFATALNONEXIT("Unable to create '%s'", fn);
     close(fd);
 
   } else {
-
-    if (unlink(fn)) PFATAL("Unable to remove '%s'", fn);
+	  unlink(fn);
+    //if (unlink(fn)) PFATAL("Unable to remove '%s'", fn);
 
   }
 
@@ -1188,13 +1207,24 @@ static void setup_shm(void) {
   memset(virgin_hang, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
 
+#ifdef CONFIG_S2E
+  key_t shmkey;
+  if((shmkey = ftok("/tmp/aflbitmap", 1)) < 0){
+        printf("ftok error:%s\n", strerror(errno));
+        PFATAL("ftok() failed");
+  }
+  shm_id = shmget(shmkey, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+#else
   shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+#endif
 
   if (shm_id < 0) PFATAL("shmget() failed");
 
   atexit(remove_shm);
 
   shm_str = alloc_printf("%d", shm_id);
+
+  ACTF("share memory id: %d", shm_id);
 
   /* If somebody is asking us to fuzz instrumented binaries in dumb mode,
      we don't want them to detect instrumentation, since we won't be sending
@@ -1273,6 +1303,13 @@ static void read_testcases(void) {
            "    directory.\n");
 
     PFATAL("Unable to open '%s'", in_dir);
+
+  }
+
+  if (shuffle_queue && nl_cnt > 1) {
+
+    ACTF("Shuffling queue...");
+    shuffle_ptrs((void**)nl, nl_cnt);
 
   }
 
@@ -2657,7 +2694,7 @@ static void perform_dry_run(char** argv) {
 
         useless_at_start++;
 
-        if (!in_bitmap)
+        if (!in_bitmap && !shuffle_queue)
           WARNF("No new instrumentation output, test case may be useless.");
 
         break;
@@ -2694,11 +2731,12 @@ static void perform_dry_run(char** argv) {
 
 static void link_or_copy(u8* old_path, u8* new_path) {
 
-  s32 i = link(old_path, new_path);
+  //s32 i = link(old_path, new_path);
+  s32 i;
   s32 sfd, dfd;
   u8* tmp;
 
-  if (!i) return;
+  //if (!i) return;
 
   sfd = open(old_path, O_RDONLY);
   if (sfd < 0) PFATAL("Unable to open '%s'", old_path);
@@ -2794,8 +2832,20 @@ static void pivot_inputs(void) {
     }
 
     /* Pivot to the new queue entry. */
-
+#ifdef  CONFIG_S2E
+	if(access(nfn, F_OK)){
+		link_or_copy(q->fname, nfn);
+	}
+#else
     link_or_copy(q->fname, nfn);
+#endif
+
+#ifdef CONFIG_S2E
+	if(strcmp(q->fname,nfn)){
+		remove(q->fname);
+	}
+#endif
+
     ck_free(q->fname);
     q->fname = nfn;
 
@@ -7520,6 +7570,7 @@ int main(int argc, char** argv) {
   if (getenv("AFL_NO_FORKSRV"))   no_forkserver    = 1;
   if (getenv("AFL_NO_CPU_RED"))   no_cpu_meter_red = 1;
   if (getenv("AFL_NO_VAR_CHECK")) no_var_check     = 1;
+ if (getenv("AFL_SHUFFLE_QUEUE")) shuffle_queue    = 1;
 
   if (dumb_mode == 2 && no_forkserver)
     FATAL("AFL_DUMB_FORKSRV and AFL_NO_FORKSRV are mutually exclusive");
@@ -7584,6 +7635,12 @@ int main(int argc, char** argv) {
   while (1) {
 
     u8 skipped_fuzz;
+
+#ifdef CONFIG_S2E
+    read_testcases();
+    pivot_inputs();
+
+#endif
 
     cull_queue();
 

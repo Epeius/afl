@@ -153,8 +153,16 @@ static void setup_shm(void) {
 
   u8* shm_str;
 
+#ifdef CONFIG_S2E
+  key_t shmkey;
+  if((shmkey = ftok("/tmp/aflbitmap", 1)) < 0){
+        printf("ftok error:%s\n", strerror(errno));
+        PFATAL("ftok() failed");
+  }
+  shm_id = shmget(shmkey, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+#else
   shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
-
+#endif
   if (shm_id < 0) PFATAL("shmget() failed");
 
   atexit(remove_shm);

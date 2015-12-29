@@ -18,7 +18,7 @@
 #define _HAVE_CONFIG_H
 
 #include "types.h"
-
+#define CONFIG_S2E
 /******************************************************
  *                                                    *
  *  Settings that may be of interest to power users:  *
