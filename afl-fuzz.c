@@ -107,19 +107,32 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_null_fd = -1,          /* Persistent fd for /dev/null      */
            fsrv_ctl_fd,               /* Fork server control pipe (write) */
            fsrv_st_fd;                /* Fork server status pipe (read)   */
+#ifdef CONFIG_S2E
+static s32 S2EAFLsyn_S2E_fd,          /* S2E write pipe */
+           S2EAFLsyn_AFL_fd;          /* AFL write pipe */
+static u8  is_firstRun = 1;           /* Whether this is 1st run          */
+#endif
 
 static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
            out_dir_fd = -1;           /* FD of the lock file              */
-
+#ifdef CONFIG_S2E
+static s32 s2e_pid;                   /* PID of the s2e           */
+#endif
 static u8* trace_bits;                /* SHM with instrumentation bitmap  */
 
-static u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
-           virgin_hang[MAP_SIZE],     /* Bits we haven't seen in hangs    */
+#ifdef CONFIG_S2E
+static u8* virgin_bits;               /* Regions yet untouched by fuzzing  */
+#else
+static u8  virgin_bits[MAP_SIZE];     /* Regions yet untouched by fuzzing */
+#endif
+static u8  virgin_hang[MAP_SIZE],     /* Bits we haven't seen in hangs    */
            virgin_crash[MAP_SIZE];    /* Bits we haven't seen in crashes  */
 
 static s32 shm_id;                    /* ID of the SHM region             */
-
+#ifdef CONFIG_S2E
+static s32 virgin_shm_id;             /* ID of the SHM region for virgin  */
+#endif
 static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
                    clear_screen = 1,  /* Window resized?                  */
                    child_timed_out;   /* Traced process timed out?        */
@@ -611,7 +624,7 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
   } else {
 	  unlink(fn);
-    //if (unlink(fn)) PFATAL("Unable to remove '%s'", fn);
+    //if (unlink(fn)) PFATALNONEXIT("Unable to remove '%s'", fn);
 
   }
 
@@ -779,7 +792,7 @@ static inline u8 has_new_bits(u8* virgin_map) {
             ((cur & FFL(5)) && (vir & FFL(5)) == FFL(5)) ||
             ((cur & FFL(6)) && (vir & FFL(6)) == FFL(6)) ||
             ((cur & FFL(7)) && (vir & FFL(7)) == FFL(7))) ret = 2;
-        else ret = 1;
+        else ret = 1; // test change
 
 #else
 
@@ -787,7 +800,7 @@ static inline u8 has_new_bits(u8* virgin_map) {
             ((cur & FF(1)) && (vir & FF(1)) == FF(1)) ||
             ((cur & FF(2)) && (vir & FF(2)) == FF(2)) ||
             ((cur & FF(3)) && (vir & FF(3)) == FF(3))) ret = 2;
-        else ret = 1;
+        else ret = 1; // test change
 
 #endif /* ^__x86_64__ */
 
@@ -1060,6 +1073,9 @@ static inline void classify_counts(u32* mem) {
 static void remove_shm(void) {
 
   shmctl(shm_id, IPC_RMID, NULL);
+#ifdef CONFIG_S2E
+  shmctl(virgin_shm_id, IPC_RMID, NULL);
+#endif
 
 }
 
@@ -1201,25 +1217,31 @@ static void cull_queue(void) {
 static void setup_shm(void) {
 
   u8* shm_str;
-
+#ifndef CONFIG_S2E
   if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
-
+#endif
   memset(virgin_hang, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
-
 #ifdef CONFIG_S2E
-  key_t shmkey;
+  key_t shmkey, virgin_shmkey;
   if((shmkey = ftok("/tmp/aflbitmap", 1)) < 0){
         printf("ftok error:%s\n", strerror(errno));
         PFATAL("ftok() failed");
   }
+  if((virgin_shmkey = ftok("/tmp/aflvirgin", 'a')) < 0){
+      printf("ftok error:%s\n", strerror(errno));
+      PFATAL("ftok() failed");
+}
   shm_id = shmget(shmkey, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+  virgin_shm_id = shmget(virgin_shmkey, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
 #else
   shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
 #endif
-
   if (shm_id < 0) PFATAL("shmget() failed");
 
+#ifdef CONFIG_S2E
+  if (virgin_shm_id < 0) PFATAL("shmget() failed");
+#endif
   atexit(remove_shm);
 
   shm_str = alloc_printf("%d", shm_id);
@@ -1232,12 +1254,27 @@ static void setup_shm(void) {
      later on, perhaps? */
 
   if (!dumb_mode) setenv(SHM_ENV_VAR, shm_str, 1);
-
   ck_free(shm_str);
 
   trace_bits = shmat(shm_id, NULL, 0);
   
   if (!trace_bits) PFATAL("shmat() failed");
+
+#ifdef CONFIG_S2E
+  u8* virgin_shm_str;
+  virgin_shm_str = alloc_printf("%d", virgin_shm_id);
+  ACTF("virgin share memory id: %d", virgin_shm_id);
+
+  if (!dumb_mode) setenv(VIRGIN_SHM_ENV_VAR, virgin_shm_str, 1);
+  ck_free(virgin_shm_str);
+
+  virgin_bits = shmat(virgin_shm_id, NULL, 0);
+
+  if (!virgin_bits) PFATAL("shmat() failed");
+
+  memset(virgin_bits, 255, MAP_SIZE);
+
+#endif
 
 }
 
@@ -1283,9 +1320,9 @@ static void read_testcases(void) {
 
   fn = alloc_printf("%s/queue", in_dir);
   if (!access(fn, F_OK)) in_dir = fn; else ck_free(fn);
-
+#ifndef CONFIG_S2E
   ACTF("Scanning '%s'...", in_dir);
-
+#endif
   /* We use scandir() + alphasort() rather than readdir() because otherwise,
      the ordering  of test cases would vary somewhat randomly and would be
      difficult to control. */
@@ -1350,6 +1387,10 @@ static void read_testcases(void) {
     ck_free(dfn);
 
     add_to_queue(fn, st.st_size, passed_det);
+//#ifdef CONFIG_S2E
+//    printf("remove %s\n",fn);
+//    remove(fn);
+//#endif
 
   }
 
@@ -2120,15 +2161,33 @@ static void init_forkserver(char** argv) {
 
 }
 
+#ifdef CONFIG_S2E
+static void init_S2EAFL_synPipe(void) {
+    // create Pipe and duplicate it
+    int s2e_side_pipe[2], afl_side_pipe[2];
+    if (pipe(s2e_side_pipe) || pipe(afl_side_pipe)){
+        PFATAL("pipe() failed");
+    }
+    if (dup2(s2e_side_pipe[1], AFLS2EHOSTPIPE_S2E + 1) < 0 || dup2(s2e_side_pipe[0], AFLS2EHOSTPIPE_S2E) < 0){
+        PFATAL("dup2() failed");
+    }
+
+    if (dup2(afl_side_pipe[1], AFLS2EHOSTPIPE_AFL + 1) < 0 || dup2(afl_side_pipe[0], AFLS2EHOSTPIPE_AFL) < 0){
+        PFATAL("dup2() failed");
+    }
+
+    S2EAFLsyn_S2E_fd = s2e_side_pipe[0]; // afl read s2e's pipe from 0 end point
+    S2EAFLsyn_AFL_fd = afl_side_pipe[1]; // afl write its pipe from 1 end point
+    OKF("All right - s2e and afl's pipes are up.");
+}
+#endif
 
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
-
 static u8 run_target(char** argv) {
-
   static struct itimerval it;
   static u32 prev_timed_out = 0;
-
+  int withS2E = 0;
   int status = 0;
   u32 tb4;
 
@@ -2141,12 +2200,39 @@ static u8 run_target(char** argv) {
   memset(trace_bits, 0, MAP_SIZE);
   MEM_BARRIER();
 
+#ifdef CONFIG_S2E
+  withS2E = 1;
+#endif
+
   /* If we're running in "dumb" mode, we can't rely on the fork server
      logic compiled into the target program, so we will just keep calling
      execve(). There is a bit of code duplication between here and 
      init_forkserver(), but c'est la vie. */
 
+#ifdef CONFIG_S2E
+  if (withS2E == 1){
+      s32 res;
+      // tell S2E we have a testcase
+     if(!is_firstRun){
+          char tmp[4];
+          tmp[0] = 'n';
+          tmp[1] = 'u';
+          tmp[2] = 'd';
+          tmp[3] = 't';
+         if ((res = write(S2EAFLsyn_AFL_fd, &tmp, 4)) != 4) {
+
+           if (stop_soon) return 0;
+           RPFATAL(res, "Unable to tell our friend S2E, oohhhh (OOM?)");
+
+         }
+
+      }
+     is_firstRun = 0;
+  }
+  else if (dumb_mode == 1 || no_forkserver) {
+#else
   if (dumb_mode == 1 || no_forkserver) {
+#endif
 
     child_pid = fork();
 
@@ -2254,10 +2340,26 @@ static u8 run_target(char** argv) {
   setitimer(ITIMER_REAL, &it, NULL);
 
   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
+#ifdef CONFIG_S2E
+      if (withS2E == 1){
+          s32 res;
+          char tmp_read[4];
+          tmp_read[0] = 'n';
+          tmp_read[1] = 'u';
+          tmp_read[2] = 'd';
+          tmp_read[3] = 't';
+          if ((res = read(S2EAFLsyn_S2E_fd, &tmp_read, 4)) != 4) {
 
-  if (dumb_mode == 1 || no_forkserver) {
+            if (stop_soon) return 0;
+            RPFATAL(res, "Unable to hear our friend S2E, oohhhh (OOM?)");
 
-    if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
+          }
+  }
+      else if (dumb_mode == 1 || no_forkserver) {
+#else
+      if (dumb_mode == 1 || no_forkserver) {
+#endif
+          if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
 
   } else {
 
@@ -2319,7 +2421,6 @@ static u8 run_target(char** argv) {
   return FAULT_NONE;
 
 }
-
 
 /* Write modified data to file for testing. If out_file is set, the old file
    is unlinked and a new one is created. Otherwise, out_fd is rewound and
@@ -2427,7 +2528,6 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
     write_to_testcase(use_mem, q->len);
 
     fault = run_target(argv);
-
     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
        we want to bail out quickly. */
 
@@ -2730,9 +2830,8 @@ static void perform_dry_run(char** argv) {
 /* Helper function: link() if possible, copy otherwise. */
 
 static void link_or_copy(u8* old_path, u8* new_path) {
-
-  //s32 i = link(old_path, new_path);
   s32 i;
+  //s32 i = link(old_path, new_path);
   s32 sfd, dfd;
   u8* tmp;
 
@@ -2767,9 +2866,9 @@ static void pivot_inputs(void) {
 
   struct queue_entry* q = queue;
   u32 id = 0;
-
+#ifndef CONFIG_S2E
   ACTF("Creating hard links for all input files...");
-
+#endif
   while (q) {
 
     u8  *nfn, *rsl = strrchr(q->fname, '/');
@@ -2833,17 +2932,17 @@ static void pivot_inputs(void) {
 
     /* Pivot to the new queue entry. */
 #ifdef  CONFIG_S2E
-	if(access(nfn, F_OK)){
-		link_or_copy(q->fname, nfn);
-	}
+    if(access(nfn, F_OK)){
+    	link_or_copy(q->fname, nfn);
+    }
 #else
     link_or_copy(q->fname, nfn);
 #endif
 
 #ifdef CONFIG_S2E
-	if(strcmp(q->fname,nfn)){
-		remove(q->fname);
-	}
+    if(strcmp(q->fname,nfn)){
+    	remove(q->fname);
+    }
 #endif
 
     ck_free(q->fname);
@@ -4359,7 +4458,6 @@ static u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   }
 
   write_to_testcase(out_buf, len);
-
   fault = run_target(argv);
 
   if (stop_soon) return 1;
@@ -7388,6 +7486,8 @@ int main(int argc, char** argv) {
   u8  *extras_dir = 0;
   u8  mem_limit_given = 0;
 
+  //no_forkserver = 1;
+
   char** use_argv;
 
   SAYF(cCYA "afl-fuzz " cBRI VERSION cRST " by <lcamtuf@google.com>\n");
@@ -7513,7 +7613,9 @@ int main(int argc, char** argv) {
         if (in_bitmap) FATAL("Multiple -B options not supported");
 
         in_bitmap = optarg;
+#ifndef CONFIG_S2E
         read_bitmap(in_bitmap);
+#endif
         break;
 
       case 'C':
@@ -7550,6 +7652,10 @@ int main(int argc, char** argv) {
 
     }
 
+#ifdef CONFIG_S2E
+  if (!out_file)  FATAL("We want to marry with S2E, why not give me the chance?");
+#endif
+
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
 
   setup_signal_handlers();
@@ -7567,10 +7673,10 @@ int main(int argc, char** argv) {
 
   }
 
-  if (getenv("AFL_NO_FORKSRV"))   no_forkserver    = 1;
-  if (getenv("AFL_NO_CPU_RED"))   no_cpu_meter_red = 1;
-  if (getenv("AFL_NO_VAR_CHECK")) no_var_check     = 1;
- if (getenv("AFL_SHUFFLE_QUEUE")) shuffle_queue    = 1;
+  if (getenv("AFL_NO_FORKSRV"))    no_forkserver    = 1;
+  if (getenv("AFL_NO_CPU_RED"))    no_cpu_meter_red = 1;
+  if (getenv("AFL_NO_VAR_CHECK"))  no_var_check     = 1;
+  if (getenv("AFL_SHUFFLE_QUEUE")) shuffle_queue    = 1;
 
   if (dumb_mode == 2 && no_forkserver)
     FATAL("AFL_DUMB_FORKSRV and AFL_NO_FORKSRV are mutually exclusive");
@@ -7587,8 +7693,13 @@ int main(int argc, char** argv) {
 
   setup_post();
   setup_shm();
+#ifdef CONFIG_S2E
+  if (in_bitmap) read_bitmap(in_bitmap);
+#endif
+
 
   setup_dirs_fds();
+
   read_testcases();
   load_auto();
 
@@ -7602,8 +7713,26 @@ int main(int argc, char** argv) {
 
   if (!out_file) setup_stdio_file();
 
-  check_binary(argv[optind]);
+#ifdef CONFIG_S2E
+  no_forkserver    = 1;
+  init_S2EAFL_synPipe();
+  // then start S2E
+  s2e_pid = fork();
 
+    if (s2e_pid < 0) PFATAL("fork() failed");
+
+    if (!s2e_pid) {
+      system("/home/epeius/work/DSlab.EPFL/FinalSubmitV2/s2ebuild/qemu-release/i386-s2e-softmmu/qemu-system-i386 "
+              "-m 128 -net none -usbdevice tablet -monitor stdio "
+              "-hda /home/epeius/work/DSlab.EPFL/FinalTest/s2ebuild/images/debian.raw.s2e "
+              "-loadvm forkstate -s2e-config-file forkstate.lua");
+      return 1;
+    }
+  sleep(20);
+  OKF("TSTTTTTTTTTTTTTTTT.");
+#else
+  check_binary(argv[optind]); // we don't want to check it in S2E mode
+#endif
   start_time = get_cur_time();
 
   if (qemu_mode)
@@ -7635,13 +7764,12 @@ int main(int argc, char** argv) {
   while (1) {
 
     u8 skipped_fuzz;
-
 #ifdef CONFIG_S2E
-    read_testcases();
-    pivot_inputs();
-
+    if(0){
+        read_testcases();
+        pivot_inputs();
+    }
 #endif
-
     cull_queue();
 
     if (!queue_cur) {
@@ -7697,7 +7825,6 @@ int main(int argc, char** argv) {
   }
 
   if (queue_cur) show_stats();
-
   write_bitmap();
   write_stats_file(0, 0);
   save_auto();
