@@ -16,18 +16,25 @@
 PROGNAME    = afl
 VERSION     = 1.96b
 
+CXX			= g++
+
 PREFIX     ?= /usr/local
 BIN_PATH    = $(PREFIX)/bin
 HELPER_PATH = $(PREFIX)/lib/afl
 DOC_PATH    = $(PREFIX)/share/doc/afl
 MISC_PATH   = $(PREFIX)/share/afl
 
+OBJS		= SegSynchronization SegSynchronizationWrapper
 PROGS       = afl-gcc afl-as afl-fuzz afl-showmap afl-tmin afl-gotcpu
 
 #CFLAGS     ?= -O3 -funroll-loops
 CFLAGS     ?= -funroll-loops
 CFLAGS     += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
 	      -DAFL_PATH=\"$(HELPER_PATH)\" -DDOC_PATH=\"$(DOC_PATH)\" \
+	      -DBIN_PATH=\"$(BIN_PATH)\" -DVERSION=\"$(VERSION)\"
+
+CXXFLAGS     ?= -O3 -funroll-loops
+CXXFLAGS     += -DAFL_PATH=\"$(HELPER_PATH)\" -DDOC_PATH=\"$(DOC_PATH)\" \
 	      -DBIN_PATH=\"$(BIN_PATH)\" -DVERSION=\"$(VERSION)\"
 
 ifneq "$(filter Linux GNU%,$(shell uname))" ""
@@ -42,7 +49,7 @@ endif
 
 COMM_HDR    = alloc-inl.h config.h debug.h types.h
 
-all: test_x86 $(PROGS) test_build all_done
+all: test_x86 $(OBJS) $(PROGS) test_build all_done
 
 ifndef AFL_NOX86
 
@@ -59,6 +66,13 @@ test_x86:
 
 endif
 
+SegSynchronization: 
+	$(CXX) -c $(CXXFLAGS) SegSynchronization.cpp
+
+SegSynchronizationWrapper: 
+	$(CXX) -c $(CXXFLAGS) SegSynchronizationWrapper.cpp
+	
+
 afl-gcc: afl-gcc.c $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
 	set -e; for i in afl-g++ afl-clang afl-clang++; do ln -sf afl-gcc $$i; done
@@ -68,7 +82,8 @@ afl-as: afl-as.c afl-as.h $(COMM_HDR) | test_x86
 	ln -sf afl-as as
 
 afl-fuzz: afl-fuzz.c  $(COMM_HDR) | test_x86
-	$(CC) $(CFLAGS) $@.c afl-parrel-qemu.c -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $@.c afl-parrel-qemu.c SegSynchronization.o SegSynchronizationWrapper.o -o $@ $(LDFLAGS)
+	rm SegSynchronization.o SegSynchronizationWrapper.o
 
 afl-showmap: afl-showmap.c $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
@@ -105,8 +120,9 @@ all_done: test_build
 .NOTPARALLEL: clean
 
 clean:
-	rm -f $(PROGS) as afl-g++ afl-clang afl-clang++ *.o *~ a.out core core.[1-9][0-9]* *.stackdump test .test test-instr .test-instr0 .test-instr1 qemu_mode/qemu-2.3.0.tar.bz2 afl-qemu-trace
-	rm -rf out_dir qemu_mode/qemu-2.3.0
+	rm -f $(PROGS) as afl-g++ afl-clang afl-clang++ *.o *~ a.out core core.[1-9][0-9]* *.stackdump test .test test-instr .test-instr0 .test-instr1 #qemu_mode/qemu-2.3.0.tar.bz2 afl-qemu-trace
+	rm -rf out_dir
+	#rm -rf out_dir qemu_mode/qemu-2.3.0
 	$(MAKE) -C llvm_mode clean
 
 install: all
