@@ -63,9 +63,13 @@
 #  include <sys/sysctl.h>
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
 
+// extern variable from afl-fuzz.c
 extern u8 parallel_qemu_num;
 extern QemuInstance * allQemus;
 extern u32 qemu_quene_fd;
+extern ReadyShm* readyshm;
+extern struct SegSynchronizationWrapper* SS;
+//extern variable end
 
 #define QEMUEXECUTABLE "/home/epeius/work/DSlab.EPFL/FinalSubmitV2/s2ebuild/qemu-release/i386-s2e-softmmu/qemu-system-i386"
 char *const qemu_argv[] ={"qemu-system-i386",
@@ -79,12 +83,42 @@ char *const qemu_argv[] ={"qemu-system-i386",
         NULL};
 
 /*
+ * Set up share memory, which could be used for qemu to inform AFL that a test has done.
+ * readyshm is handled in signal's handler.
+ */
+void PARAL_QEMU(SetupSHM4Ready)(void)
+{
+    void *shm = NULL;
+    int shmid;
+    shmid = shmget((key_t) READYSHMID, sizeof(ReadyShm), 0666 | IPC_CREAT);
+    if (shmid == -1) {
+        fprintf(stderr, "shmget failed\n");
+        exit(EXIT_FAILURE);
+    }
+    shm = shmat(shmid, (void*) 0, 0);
+    if (shm == (void*) -1)
+        PFATAL("shmat() failed");
+    OKF("Ready share memory attached at %X.\n", (int) shm);
+    readyshm = (ReadyShm*) shm;
+    // initialization
+    SS = SegSynchronizationWrapper_GetInstance();
+    SegSynchronization_initsem(SS, SMKEY);
+    SegSynchronization_acquire(SS);
+    INIT_READYSHM(readyshm);
+    SegSynchronization_release(SS);
+}
+/*
  * We don't create bitmap here because we cannot synchonize well with qemu, so give this chance to qemus.
  * While control pipes could be initialed at both sides.
  */
 void PARAL_QEMU(InitQemuQueue)(void)
 {
-    qemu_quene_fd = open(QEMUQUEUE, O_RDONLY); // we only need one queue here and set mode as read-only
+    if (access(QEMUQUEUE, F_OK) == -1) {
+        int res = mkfifo(QEMUQUEUE, 0777);
+        if (res != 0)
+            PFATAL("mkfifo() failed");
+    }
+    qemu_quene_fd = open(QEMUQUEUE, O_RDONLY|O_NONBLOCK); // we only need one queue here and set mode as read-only
     if (qemu_quene_fd == -1)
         PFATAL("Create qemu queue fifo failed.");
 
@@ -98,29 +132,38 @@ void PARAL_QEMU(InitQemuQueue)(void)
     u8 i = 0;
     allQemus = (QemuInstance*) malloc(parallel_qemu_num * sizeof(QemuInstance));
     while (i < parallel_qemu_num) {
+        // set up control pipe
+        int fd[2];
+        if (pipe(fd) != 0)
+            PFATAL("pipe() failed");
         pid_t pid = fork();
         if (pid < 0)
             PFATAL("fork() failed");
         if (!pid) {
+            if (dup2(fd[1], CTRLPIPE(getpid()) + 1) < 0
+                                || dup2(fd[0], CTRLPIPE(getpid())) < 0) // Duplicate file descriptor before execv(), \
+                                                                    otherwise QEMU cannot access pipes forever.
+                exit(EXIT_FAILURE);
             execv(QEMUEXECUTABLE, qemu_argv);
         } else {
             allQemus[i].pid = pid;
+            allQemus[i].start_us = 0;
+            allQemus[i].stop_us = 0;
+            allQemus[i].isfree = 1;
+            allQemus[i].cur_queue = NULL;
+            allQemus[i].cur_stage = 18; // Initial stage
             u8* _tcDir = (u8*) malloc(128);
             sprintf(_tcDir, "/tmp/afltestcase/%d/", pid);
-            mkdir(_tcDir, 0777);
+            if(access(_tcDir, F_OK))
+                mkdir(_tcDir, 0777);
             allQemus[i].testcaseDir = _tcDir;
-            // set up control pipe
-            int fd[2];
-            if (pipe(fd) != 0)
-                PFATAL("pipe() failed");
             if (dup2(fd[1], CTRLPIPE(pid) + 1) < 0
                     || dup2(fd[0], CTRLPIPE(pid)) < 0)
                 PFATAL("dup2() failed");
             allQemus[i].ctrl_pipe = CTRLPIPE(pid) + 1;
-            close(fd[0]); // afl doesn't need read control pipe anymore.
         }
         i++;
-        sleep(2); // why not sleep for a while.
+        sleep(10); // why not sleep for a while.
     }
 }
 

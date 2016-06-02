@@ -19,6 +19,7 @@
 
 #include "types.h"
 #define CONFIG_S2E
+
 /******************************************************
  *                                                    *
  *  Settings that may be of interest to power users:  *

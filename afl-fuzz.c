@@ -31,7 +31,7 @@
 #include "debug.h"
 #include "alloc-inl.h"
 #include "hash.h"
-
+#include "afl-parrel-qemu.h"
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -101,6 +101,15 @@ static u8  skip_deterministic,        /* Skip deterministic stages?       */
            qemu_mode,                 /* Running in QEMU mode?            */
            skip_requested,            /* Skip request, via SIGUSR1        */
            run_over10m;               /* Run time over 10 minutes?        */
+#ifdef CONFIG_S2E
+u8              parallel_qemu_num = 1;     /* How many qemu instances parallel */
+QemuInstance*   allQemus;                  /* Collection of all qemu instances */
+QemuInstance*   curQemu;                   /* Current free qemu instance       */
+u32             qemu_quene_fd;             /* Fd of qemu queue as FIFO         */
+ReadyShm*       readyshm;                  /* Ready share memory of qemu       */
+struct SegSynchronizationWrapper* SS;
+char**          g_argv;                    /* Shadow of user-argv              */
+#endif
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
@@ -110,15 +119,11 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
 #ifdef CONFIG_S2E
 static s32 S2EAFLsyn_S2E_fd,          /* S2E write pipe */
            S2EAFLsyn_AFL_fd;          /* AFL write pipe */
-static u8  is_firstRun = 1;           /* Whether this is 1st run          */
 #endif
 
 static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
            out_dir_fd = -1;           /* FD of the lock file              */
-#ifdef CONFIG_S2E
-static s32 s2e_pid;                   /* PID of the s2e           */
-#endif
 static u8* trace_bits;                /* SHM with instrumentation bitmap  */
 
 #ifdef CONFIG_S2E
@@ -277,7 +282,9 @@ enum {
   /* 13 */ STAGE_EXTRAS_UI,
   /* 14 */ STAGE_EXTRAS_AO,
   /* 15 */ STAGE_HAVOC,
-  /* 16 */ STAGE_SPLICE
+  /* 16 */ STAGE_SPLICE,
+  /* 17 */ STAGE_CALIBRATE,      /* Extra stage enumeration by epeius */
+  /* 18 */ STAGE_INITIAL
 };
 
 /* Stage value types */
@@ -741,15 +748,21 @@ static void read_bitmap(u8* fname) {
 static inline u8 has_new_bits(u8* virgin_map) {
 
 #ifdef __x86_64__
-
+#ifdef CONFIG_S2E
+  u64* current = (u64*)(curQemu->trace_bits);
+#else
   u64* current = (u64*)trace_bits;
+#endif
   u64* virgin  = (u64*)virgin_map;
 
   u32  i = (MAP_SIZE >> 3);
 
 #else
-
+#ifdef CONFIG_S2E
+  u32* current = (u32*)(curQemu->trace_bits);
+#else
   u32* current = (u32*)trace_bits;
+#endif
   u32* virgin  = (u32*)virgin_map;
 
   u32  i = (MAP_SIZE >> 2);
@@ -2185,23 +2198,27 @@ static void init_S2EAFL_synPipe(void) {
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 static u8 run_target(char** argv) {
+#ifndef CONFIG_S2E
   static struct itimerval it;
+#endif
   static u32 prev_timed_out = 0;
-  int withS2E = 0;
+#ifndef CONFIG_S2E
   int status = 0;
   u32 tb4;
-
+#endif
   child_timed_out = 0;
 
   /* After this memset, trace_bits[] are effectively volatile, so we
      must prevent any earlier operations from venturing into that
      territory. */
-
+#ifdef CONFIG_S2E
+  memset(curQemu->trace_bits, 0, MAP_SIZE);
+#else
   memset(trace_bits, 0, MAP_SIZE);
+#endif
   MEM_BARRIER();
 
 #ifdef CONFIG_S2E
-  withS2E = 1;
 #endif
 
   /* If we're running in "dumb" mode, we can't rely on the fork server
@@ -2210,29 +2227,25 @@ static u8 run_target(char** argv) {
      init_forkserver(), but c'est la vie. */
 
 #ifdef CONFIG_S2E
-  if (withS2E == 1){
       s32 res;
-      // tell S2E we have a testcase
-     if(!is_firstRun){
-          char tmp[4];
-          tmp[0] = 'n';
-          tmp[1] = 'u';
-          tmp[2] = 'd';
-          tmp[3] = 't';
-         if ((res = write(S2EAFLsyn_AFL_fd, &tmp, 4)) != 4) {
+      // tell current qemu instance we have a testcase
+      char tmp[4];
+      tmp[0] = 'n';
+      tmp[1] = 'u';
+      tmp[2] = 'd';
+      tmp[3] = 't';
+      curQemu->start_us = get_cur_time_us();
+      curQemu->isfree = 0;
+     if ((res = write(CTRLPIPE(curQemu->pid) + 1, &tmp, 4)) != 4) {
 
-           if (stop_soon) return 0;
-           RPFATAL(res, "Unable to tell our friend S2E, oohhhh (OOM?)");
+       if (stop_soon) return 0;
+       RPFATAL(res, "Unable to tell our friend S2E, oohhhh (OOM?)");
 
-         }
+     }
 
-      }
-     is_firstRun = 0;
-  }
-  else if (dumb_mode == 1 || no_forkserver) {
 #else
   if (dumb_mode == 1 || no_forkserver) {
-#endif
+
 
     child_pid = fork();
 
@@ -2332,6 +2345,8 @@ static u8 run_target(char** argv) {
 
   }
 
+  //TODO: Move this checks when we find a free qemu instance
+
   /* Configure timeout, as requested by user, then wait for child to terminate. */
 
   it.it_value.tv_sec = (exec_tmout / 1000);
@@ -2339,27 +2354,10 @@ static u8 run_target(char** argv) {
 
   setitimer(ITIMER_REAL, &it, NULL);
 
+
   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
-#ifdef CONFIG_S2E
-      if (withS2E == 1){
-          s32 res;
-          char tmp_read[4];
-          tmp_read[0] = 'n';
-          tmp_read[1] = 'u';
-          tmp_read[2] = 'd';
-          tmp_read[3] = 't';
-          if ((res = read(S2EAFLsyn_S2E_fd, &tmp_read, 4)) != 4) {
-
-            if (stop_soon) return 0;
-            RPFATAL(res, "Unable to hear our friend S2E, oohhhh (OOM?)");
-
-          }
-  }
-      else if (dumb_mode == 1 || no_forkserver) {
-#else
-      if (dumb_mode == 1 || no_forkserver) {
-#endif
-          if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
+    if (dumb_mode == 1 || no_forkserver) {
+      if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
 
   } else {
 
@@ -2417,7 +2415,7 @@ static u8 run_target(char** argv) {
 
   if ((dumb_mode == 1 || no_forkserver) && tb4 == EXEC_FAIL_SIG)
     return FAULT_ERROR;
-
+#endif
   return FAULT_NONE;
 
 }
@@ -2425,23 +2423,71 @@ static u8 run_target(char** argv) {
 /* Write modified data to file for testing. If out_file is set, the old file
    is unlinked and a new one is created. Otherwise, out_fd is rewound and
    truncated. */
+/*
+ * Change Log:
+ * When writing testcase to file, first check which qemu is ready then write file to its
+ *    test case directory.
+ */
 
-static void write_to_testcase(void* mem, u32 len) {
+#ifdef CONFIG_S2E
+#include <assert.h> // for assert
+#endif
+
+static void write_to_testcase(void* mem, u32 len, struct queue_entry* cur, u8 cur_stage) {
 
   s32 fd = out_fd;
 
+  // Fetch test case directory
+#ifdef CONFIG_S2E
+  u8 buffer[FIFOBUFFERSIZE + 1];
+  int tarQemuPid = 0;
+  while(!tarQemuPid){
+      memset(buffer, '\0', sizeof(buffer));
+      if(read(qemu_quene_fd, buffer, FIFOBUFFERSIZE) == -1)
+          if(errno == EAGAIN) // try again
+              continue;
+          //PFATAL("Read from qemu_queue error, give up. Errno.%02d is: %s/n", errno, strerror(errno));
+      tarQemuPid = atoi(buffer);
+  }
+  u8 i = 0;
+  while (i < parallel_qemu_num) {
+      if(tarQemuPid == allQemus[i].pid){
+          curQemu = &allQemus[i];
+          break;
+      }
+      i++;
+  }
+  if(curQemu->start_us){ // not the first run
+      curQemu->stop_us = get_cur_time_us();
+  }
+  curQemu->cur_queue = cur;
+  curQemu->cur_stage = cur_stage;
+  assert(i < parallel_qemu_num && "Cannot find target qemu?");
+  u8 tc_out_file[128];
+  sprintf(tc_out_file, "%s%s", allQemus[i].testcaseDir, basename(out_file));
+#endif
+
   if (out_file) {
-
+#ifdef CONFIG_S2E
+    unlink(tc_out_file);
+    fd = open(tc_out_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) PFATAL("Unable to create '%s'", tc_out_file);
+#else
     unlink(out_file); /* Ignore errors. */
-
     fd = open(out_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
 
     if (fd < 0) PFATAL("Unable to create '%s'", out_file);
+#endif
 
   } else lseek(fd, 0, SEEK_SET);
-
+#ifdef CONFIG_S2E
+  curQemu->out_file = (u8*)malloc(len);
+  memcpy(curQemu->out_file, mem, len);
+  curQemu->len = len;
+  ck_write(fd, mem, len, tc_out_file);
+#else
   ck_write(fd, mem, len, out_file);
-
+#endif
   if (!out_file) {
 
     if (ftruncate(fd, len)) PFATAL("ftruncate() failed");
@@ -2489,6 +2535,12 @@ static void show_stats(void);
    to warn about flaky or otherwise problematic test cases early on; and when
    new paths are discovered to detect variable behavior and so on. */
 
+/*
+  Calibration tries to discover variable behavior in the same testcase, which needs
+  to execute to many repeat times. As this is implemented as serialization, so we have
+  to change it to a parallel when in multi-qemu mode (Changed to PARAL_QEMU(calibrate_case)).
+  NOTE: Missing some fine-grained check.
+ */
 static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
                          u32 handicap, u8 from_queue) {
 
@@ -2525,7 +2577,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
     if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
 
-    write_to_testcase(use_mem, q->len);
+    write_to_testcase(use_mem, q->len, NULL, STAGE_CALIBRATE);
 
     fault = run_target(argv);
     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
@@ -2605,6 +2657,47 @@ abort_calibration:
 
 }
 
+// Assume the case has no variable behavior, so execute each just once time.
+static u8 PARAL_QEMU(calibrate_case)(char** argv, struct queue_entry* q, u8* use_mem,
+                         u32 handicap, u8 from_queue) {
+
+  u8  fault = 0;
+
+  s32 old_sc = stage_cur, old_sm = stage_max, old_tmout = exec_tmout;
+  u8* old_sn = stage_name;
+
+  /* Be a bit more generous about timeouts when resuming sessions, or when
+     trying to calibrate already-added finds. This helps avoid trouble due
+     to intermittent latency. */
+
+  if (!from_queue || resuming_fuzz)
+    exec_tmout = MAX(exec_tmout + CAL_TMOUT_ADD,
+                     exec_tmout * CAL_TMOUT_PERC / 100);
+
+
+  stage_name = "calibration";
+
+  /* Make sure the forkserver is up before we do anything, and let's not
+     count its spin-up time toward binary calibration. */
+
+  if (dumb_mode != 1 && !no_forkserver && !forksrv_pid)
+    init_forkserver(argv);
+
+  write_to_testcase(use_mem, q->len, q, STAGE_CALIBRATE);
+
+  fault = run_target(argv);
+
+  total_cal_cycles += 1;
+
+  q->cal_failed  = 0;
+  stage_name = old_sn;
+  stage_cur  = old_sc;
+  stage_max  = old_sm;
+  exec_tmout = old_tmout;
+
+
+  return fault;
+}
 
 /* Examine map coverage. Called once, for first test case. */
 
@@ -2628,7 +2721,9 @@ static void check_map_coverage(void) {
 static void perform_dry_run(char** argv) {
 
   struct queue_entry* q = queue;
+#ifndef CONFIG_S2E
   u32 cal_failures = 0;
+#endif
   u8* skip_crashes = getenv("AFL_SKIP_CRASHES");
 
   while (q) {
@@ -2650,12 +2745,17 @@ static void perform_dry_run(char** argv) {
       FATAL("Short read from '%s'", q->fname);
 
     close(fd);
-
+#ifdef CONFIG_S2E
+    res = PARAL_QEMU(calibrate_case)(argv, q, use_mem, 0, 1);
+#else
     res = calibrate_case(argv, q, use_mem, 0, 1);
+#endif
+
     ck_free(use_mem);
 
     if (stop_soon) return;
-
+    // TODO: Move to SIGUSER2 handler
+#ifndef CONFIG_S2E
     if (res == crash_mode || res == FAULT_NOBITS)
       SAYF(cGRA "    len = %u, map size = %u, exec speed = %llu us\n" cRST, 
            q->len, q->bitmap_size, q->exec_us);
@@ -2802,11 +2902,11 @@ static void perform_dry_run(char** argv) {
     }
 
     if (q->var_behavior) WARNF("Instrumentation output varies across runs.");
-
+#endif
     q = q->next;
 
   }
-
+#ifndef CONFIG_S2E
   if (cal_failures) {
 
     if (cal_failures == queued_paths)
@@ -2821,7 +2921,12 @@ static void perform_dry_run(char** argv) {
       WARNF(cLRD "High percentage of rejected test cases, check settings!");
 
   }
+#endif
 
+#ifdef CONFIG_S2E
+  /* wait until all qemus are free, which means all initial test cases are processed */
+  WAIT_ALLQEMUS_FREE
+#endif
   OKF("All test cases processed.");
 
 }
@@ -3057,6 +3162,7 @@ static void write_crash_readme(void) {
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
 
+// NOTE: In Mul-QEMU mode, argv can be NULL.
 static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
   u8  *fn = "";
@@ -3091,17 +3197,33 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       queue_top->has_new_cov = 1;
       queued_with_cov++;
     }
-
+#ifdef CONFIG_S2E
+    queue_top->exec_cksum = hash32(curQemu->trace_bits, MAP_SIZE, HASH_CONST);
+#else
     queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+#endif
 
+#ifdef CONFIG_S2E
+    /* Giving up calibration (serialization procedure), just
+       calculate bitmap score here. */
+    queue_top->exec_us     = (curQemu->stop_us - curQemu->start_us);
+    queue_top->bitmap_size = count_bytes(curQemu->trace_bits);
+    queue_top->handicap    = queue_cycle - 1;
+    queue_top->cal_failed  = 0;
+
+    total_bitmap_size += queue_top->bitmap_size;
+    total_bitmap_entries++;
+
+    update_bitmap_score(queue_top);
+
+#else
     /* Try to calibrate inline; this also calls update_bitmap_score() when
-       successful. */
-
+           successful. */
     res = calibrate_case(argv, queue_top, mem, queue_cycle - 1, 0);
 
     if (res == FAULT_ERROR)
       FATAL("Unable to execute target application");
-
+#endif
     fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) PFATAL("Unable to create '%s'", fn);
     ck_write(fd, mem, len, fn);
@@ -3125,13 +3247,19 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       if (unique_hangs >= KEEP_UNIQUE_HANG) return keeping;
 
       if (!dumb_mode) {
-
+#ifdef CONFIG_S2E
+#ifdef __x86_64__
+        simplify_trace((u64*)(curQemu->trace_bits));
+#else
+        simplify_trace((u32*)(curQemu->trace_bits));
+#endif /* ^__x86_64__ */
+#else // Not CONFIG_S2E
 #ifdef __x86_64__
         simplify_trace((u64*)trace_bits);
 #else
         simplify_trace((u32*)trace_bits);
 #endif /* ^__x86_64__ */
-
+#endif // CONFIG_S2E
         if (!has_new_bits(virgin_hang)) return keeping;
 
       }
@@ -3165,11 +3293,19 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
       if (!dumb_mode) {
 
+#ifdef CONFIG_S2E
+#ifdef __x86_64__
+        simplify_trace((u64*)(curQemu->trace_bits));
+#else
+        simplify_trace((u32*)(curQemu->trace_bits));
+#endif /* ^__x86_64__ */
+#else // Not CONFIG_S2E
 #ifdef __x86_64__
         simplify_trace((u64*)trace_bits);
 #else
         simplify_trace((u32*)trace_bits);
 #endif /* ^__x86_64__ */
+#endif // CONFIG_S2E
 
         if (!has_new_bits(virgin_crash)) return keeping;
 
@@ -3215,6 +3351,46 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
 }
 
+static void check_qemu_tracebits(QemuInstance* qemu)
+{
+    // avoid compiler accesses registers and cache.
+    MEM_BARRIER();
+
+    if (qemu->cur_queue) { // FIXME: calibration ? Only do calibration once at perform_dry_run.
+        struct queue_entry* _cur = (struct queue_entry*) (qemu->cur_queue);
+        total_cal_us += qemu->stop_us - qemu->start_us;
+        total_cal_cycles += 1;
+
+        /* OK, let's collect some stats about the performance of this test case.
+         This is used for fuzzing air time calculations in calculate_score(). */
+
+        _cur->exec_us = (qemu->stop_us - qemu->start_us);
+        _cur->bitmap_size = count_bytes(qemu->trace_bits);
+        _cur->handicap = 0;
+        _cur->cal_failed = 0;
+        _cur->exec_cksum = hash32(qemu->trace_bits, MAP_SIZE, HASH_CONST);
+        total_bitmap_size += _cur->bitmap_size;
+        total_bitmap_entries++;
+
+        update_bitmap_score(_cur);
+    } else {
+
+        // set the loop bucket
+#ifdef __x86_64__
+        classify_counts((u64*)qemu->trace_bits);
+#else
+        classify_counts((u32*) qemu->trace_bits);
+#endif /* ^__x86_64__ */
+        queued_discovered += save_if_interesting(g_argv, (qemu->out_file),
+                (qemu->len), FAULT_NONE);
+    }
+    if (qemu->out_file) {
+        free(qemu->out_file); // avoid memory leak
+        qemu->out_file = NULL;
+    }
+    qemu->len = 0;
+    qemu->cur_queue = NULL;
+}
 
 /* When resuming, try to find the queue position to start from. This makes sense
    only when resuming, and when we can find the original fuzzer_stats. */
@@ -4446,7 +4622,7 @@ abort_trimming:
    error conditions, returning 1 if it's time to bail out. This is
    a helper function for fuzz_one(). */
 
-static u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
+static u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len, u8 _stage) {
 
   u8 fault;
 
@@ -4457,11 +4633,11 @@ static u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   }
 
-  write_to_testcase(out_buf, len);
+  write_to_testcase(out_buf, len, NULL, _stage);
   fault = run_target(argv);
 
   if (stop_soon) return 1;
-
+#ifndef CONFIG_S2E
   if (fault == FAULT_HANG) {
 
     if (subseq_hangs++ > HANG_LIMIT) {
@@ -4488,7 +4664,7 @@ static u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
     show_stats();
-
+#endif
   return 0;
 
 }
@@ -4892,7 +5068,9 @@ static u8 fuzz_one(char** argv) {
   /************
    * TRIMMING *
    ************/
-
+#ifdef CONFIG_S2E
+  queue_cur->trim_done = 1; // Give up trimming as a serialization procedure.
+#endif
   if (!dumb_mode && !queue_cur->trim_done) {
 
     u8 res = trim_case(argv, queue_cur, in_buf);
@@ -4956,7 +5134,7 @@ static u8 fuzz_one(char** argv) {
 
     FLIP_BIT(out_buf, stage_cur);
 
-    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+    if (common_fuzz_stuff(argv, out_buf, len, STAGE_FLIP1)) goto abandon_entry;
 
     FLIP_BIT(out_buf, stage_cur);
 
@@ -4986,7 +5164,7 @@ static u8 fuzz_one(char** argv) {
        behavior, but fails gracefully, so we'll carry out the checks anyway.
 
       */
-
+#ifndef CONFIG_S2E
     if (!dumb_mode && (stage_cur & 7) == 7) {
 
       u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
@@ -5026,15 +5204,19 @@ static u8 fuzz_one(char** argv) {
       }
 
     }
-
+#endif
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
+#endif
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_FLIP1]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP1] += stage_max;
 
   if (queue_cur->passed_det) goto havoc_stage;
+
+
 
   /* Two walking bits. */
 
@@ -5051,13 +5233,15 @@ static u8 fuzz_one(char** argv) {
     FLIP_BIT(out_buf, stage_cur);
     FLIP_BIT(out_buf, stage_cur + 1);
 
-    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+    if (common_fuzz_stuff(argv, out_buf, len, STAGE_FLIP2)) goto abandon_entry;
 
     FLIP_BIT(out_buf, stage_cur);
     FLIP_BIT(out_buf, stage_cur + 1);
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
+#endif
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_FLIP2]  += new_hit_cnt - orig_hit_cnt;
@@ -5080,7 +5264,7 @@ static u8 fuzz_one(char** argv) {
     FLIP_BIT(out_buf, stage_cur + 2);
     FLIP_BIT(out_buf, stage_cur + 3);
 
-    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+    if (common_fuzz_stuff(argv, out_buf, len, STAGE_FLIP4)) goto abandon_entry;
 
     FLIP_BIT(out_buf, stage_cur);
     FLIP_BIT(out_buf, stage_cur + 1);
@@ -5088,12 +5272,13 @@ static u8 fuzz_one(char** argv) {
     FLIP_BIT(out_buf, stage_cur + 3);
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_FLIP4]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP4] += stage_max;
-
+#endif
   /* Effector map setup. These macros calculate:
 
      EFF_APOS      - position of a particular file offset in the map.
@@ -5132,13 +5317,13 @@ static u8 fuzz_one(char** argv) {
 
     out_buf[stage_cur] ^= 0xFF;
 
-    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+    if (common_fuzz_stuff(argv, out_buf, len, STAGE_FLIP8)) goto abandon_entry;
 
     /* We also use this stage to pull off a simple trick: we identify
        bytes that seem to have no effect on the current execution path
        even when fully flipped - and we skip them during more expensive
        deterministic stages, such as arithmetics or known ints. */
-
+#ifndef CONFIG_S2E
     if (!eff_map[EFF_APOS(stage_cur)]) {
 
       u32 cksum;
@@ -5157,7 +5342,7 @@ static u8 fuzz_one(char** argv) {
       }
 
     }
-
+#endif
     out_buf[stage_cur] ^= 0xFF;
 
   }
@@ -5180,12 +5365,15 @@ static u8 fuzz_one(char** argv) {
   }
 
   blocks_eff_total += EFF_ALEN(len);
-
+#ifndef CONFIG_S2E
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_FLIP8]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP8] += stage_max;
-
+#else
+  WAIT_ALLQEMUS_FREE
+  stage_cycles[STAGE_FLIP8] += stage_max;
+#endif
   /* Two walking bytes. */
 
   if (len < 2) goto skip_bitflip;
@@ -5210,19 +5398,22 @@ static u8 fuzz_one(char** argv) {
 
     *(u16*)(out_buf + i) ^= 0xFFFF;
 
-    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+    if (common_fuzz_stuff(argv, out_buf, len, STAGE_FLIP16)) goto abandon_entry;
     stage_cur++;
 
     *(u16*)(out_buf + i) ^= 0xFFFF;
 
 
   }
-
+#ifndef CONFIG_S2E
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_FLIP16]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP16] += stage_max;
-
+#else
+  WAIT_ALLQEMUS_FREE
+  stage_cycles[STAGE_FLIP16] += stage_max;
+#endif
   if (len < 4) goto skip_bitflip;
 
   /* Four walking bytes. */
@@ -5247,17 +5438,19 @@ static u8 fuzz_one(char** argv) {
 
     *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
 
-    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+    if (common_fuzz_stuff(argv, out_buf, len, STAGE_FLIP32)) goto abandon_entry;
     stage_cur++;
 
     *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_FLIP32]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP32] += stage_max;
+#endif
 
 skip_bitflip:
 
@@ -5301,7 +5494,7 @@ skip_bitflip:
         stage_cur_val = j;
         out_buf[i] = orig + j;
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_ARITH8)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5313,7 +5506,7 @@ skip_bitflip:
         stage_cur_val = -j;
         out_buf[i] = orig - j;
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_ARITH8)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5323,12 +5516,13 @@ skip_bitflip:
     }
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_ARITH8]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_ARITH8] += stage_max;
-
+#endif
   /* 16-bit arithmetics, both endians. */
 
   if (len < 2) goto skip_arith;
@@ -5372,7 +5566,7 @@ skip_bitflip:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = orig + j;
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_ARITH16)) goto abandon_entry;
         stage_cur++;
  
       } else stage_max--;
@@ -5382,7 +5576,7 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = orig - j;
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_ARITH16)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5397,7 +5591,7 @@ skip_bitflip:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) + j);
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_ARITH16)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5407,7 +5601,7 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) - j);
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_ARITH16)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5417,12 +5611,13 @@ skip_bitflip:
     }
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_ARITH16]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_ARITH16] += stage_max;
-
+#endif
   /* 32-bit arithmetics, both endians. */
 
   if (len < 4) goto skip_arith;
@@ -5465,7 +5660,7 @@ skip_bitflip:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = orig + j;
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_ARITH32)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5475,7 +5670,7 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = orig - j;
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_ARITH32)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5489,7 +5684,7 @@ skip_bitflip:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) + j);
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_ARITH32)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5499,7 +5694,7 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) - j);
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_ARITH32)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5509,12 +5704,13 @@ skip_bitflip:
     }
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_ARITH32]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_ARITH32] += stage_max;
-
+#endif
 skip_arith:
 
   /**********************
@@ -5558,7 +5754,7 @@ skip_arith:
       stage_cur_val = interesting_8[j];
       out_buf[i] = interesting_8[j];
 
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+      if (common_fuzz_stuff(argv, out_buf, len, STAGE_INTEREST8)) goto abandon_entry;
 
       out_buf[i] = orig;
       stage_cur++;
@@ -5566,12 +5762,13 @@ skip_arith:
     }
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_INTEREST8]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_INTEREST8] += stage_max;
-
+#endif
   /* Setting 16-bit integers, both endians. */
 
   if (len < 2) goto skip_interest;
@@ -5611,7 +5808,7 @@ skip_arith:
 
         *(u16*)(out_buf + i) = interesting_16[j];
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_INTEREST16)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5624,7 +5821,7 @@ skip_arith:
         stage_val_type = STAGE_VAL_BE;
 
         *(u16*)(out_buf + i) = SWAP16(interesting_16[j]);
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_INTEREST16)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5634,12 +5831,13 @@ skip_arith:
     *(u16*)(out_buf + i) = orig;
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_INTEREST16]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_INTEREST16] += stage_max;
-
+#endif
   if (len < 4) goto skip_interest;
 
   /* Setting 32-bit integers, both endians. */
@@ -5680,7 +5878,7 @@ skip_arith:
 
         *(u32*)(out_buf + i) = interesting_32[j];
 
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_INTEREST32)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5693,7 +5891,7 @@ skip_arith:
         stage_val_type = STAGE_VAL_BE;
 
         *(u32*)(out_buf + i) = SWAP32(interesting_32[j]);
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+        if (common_fuzz_stuff(argv, out_buf, len, STAGE_INTEREST32)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5703,12 +5901,13 @@ skip_arith:
     *(u32*)(out_buf + i) = orig;
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_INTEREST32]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_INTEREST32] += stage_max;
-
+#endif
 skip_interest:
 
   /********************
@@ -5759,7 +5958,7 @@ skip_interest:
       last_len = extras[j].len;
       memcpy(out_buf + i, extras[j].data, last_len);
 
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+      if (common_fuzz_stuff(argv, out_buf, len, STAGE_EXTRAS_UO)) goto abandon_entry;
 
       stage_cur++;
 
@@ -5769,12 +5968,13 @@ skip_interest:
     memcpy(out_buf + i, in_buf + i, last_len);
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_EXTRAS_UO]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_EXTRAS_UO] += stage_max;
-
+#endif
   /* Insertion of user-supplied extras. */
 
   stage_name  = "user extras (insert)";
@@ -5798,7 +5998,7 @@ skip_interest:
       /* Copy tail */
       memcpy(ex_tmp + i + extras[j].len, out_buf + i, len - i);
 
-      if (common_fuzz_stuff(argv, ex_tmp, len + extras[j].len)) {
+      if (common_fuzz_stuff(argv, ex_tmp, len + extras[j].len, STAGE_EXTRAS_UI)) {
         ck_free(ex_tmp);
         goto abandon_entry;
       }
@@ -5813,12 +6013,13 @@ skip_interest:
   }
 
   ck_free(ex_tmp);
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_EXTRAS_UI]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_EXTRAS_UI] += stage_max;
-
+#endif
 skip_user_extras:
 
   if (!a_extras_cnt) goto skip_extras;
@@ -5854,7 +6055,7 @@ skip_user_extras:
       last_len = a_extras[j].len;
       memcpy(out_buf + i, a_extras[j].data, last_len);
 
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+      if (common_fuzz_stuff(argv, out_buf, len, STAGE_EXTRAS_AO)) goto abandon_entry;
 
       stage_cur++;
 
@@ -5864,12 +6065,13 @@ skip_user_extras:
     memcpy(out_buf + i, in_buf + i, last_len);
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_EXTRAS_AO]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_EXTRAS_AO] += stage_max;
-
+#endif
 skip_extras:
 
   /* If we made this to here without jumping to havoc_stage or abandon_entry,
@@ -6287,8 +6489,16 @@ havoc_stage:
 
     }
 
-    if (common_fuzz_stuff(argv, out_buf, temp_len))
-      goto abandon_entry;
+    if (!splice_cycle) {
+        if (common_fuzz_stuff(argv, out_buf, temp_len, STAGE_HAVOC))
+            goto abandon_entry;
+    } else {
+        if (common_fuzz_stuff(argv, out_buf, temp_len, STAGE_SPLICE))
+            goto abandon_entry;
+    }
+
+
+
 
     /* out_buf might have been mangled a bit, so let's restore it to its
        original size and shape. */
@@ -6312,7 +6522,8 @@ havoc_stage:
     }
 
   }
-
+#ifdef CONFIG_S2E
+  WAIT_ALLQEMUS_FREE
   new_hit_cnt = queued_paths + unique_crashes;
 
   if (!splice_cycle) {
@@ -6322,6 +6533,7 @@ havoc_stage:
     stage_finds[STAGE_SPLICE]  += new_hit_cnt - orig_hit_cnt;
     stage_cycles[STAGE_SPLICE] += stage_max;
   }
+#endif
 
 #ifndef IGNORE_FINDS
 
@@ -6540,7 +6752,7 @@ static void sync_fuzzers(char** argv) {
         /* See what happens. We rely on save_if_interesting() to catch major
            errors and save the test case. */
 
-        write_to_testcase(mem, st.st_size);
+        write_to_testcase(mem, st.st_size, NULL, STAGE_INITIAL); // FIXME:
 
         fault = run_target(argv);
 
@@ -6574,6 +6786,38 @@ static void sync_fuzzers(char** argv) {
 
 }
 
+static void do_extra_handles(QemuInstance* qemu)
+{
+    switch (qemu->cur_stage) {
+        case STAGE_CALIBRATE:
+            break;
+        case STAGE_INITIAL:
+            if (!sync_id)
+                assert(0 && "Do not try initial stage in single fuzzer mode.");
+            break;
+        case STAGE_FLIP1:
+        case STAGE_FLIP2:
+        case STAGE_FLIP4:
+        case STAGE_FLIP8:
+        case STAGE_FLIP16:
+        case STAGE_FLIP32:
+        case STAGE_ARITH8:
+        case STAGE_ARITH16:
+        case STAGE_ARITH32:
+        case STAGE_INTEREST8:
+        case STAGE_INTEREST16:
+        case STAGE_INTEREST32:
+        case STAGE_EXTRAS_UO:
+        case STAGE_EXTRAS_UI:
+        case STAGE_EXTRAS_AO:
+        case STAGE_HAVOC:
+        case STAGE_SPLICE:
+            break;
+        default:
+            assert(0 && "Cannot be here");
+            break;
+    }
+}
 
 /* Handle stop signal (Ctrl-C, etc). */
 
@@ -6595,6 +6839,40 @@ static void handle_skipreq(int sig) {
 
 }
 
+/* Handle qemu's test done (SIGUSR2). */
+
+static void handle_onetestdone(int sig) {
+    // See which qemu is done, this should be done in atom-mode.
+    //OKF("start onetestdone.");
+    SegSynchronization_acquire(SS);
+    int tarQemuPid = readyshm->pid;
+    u8 i = 0;
+    QemuInstance* done_qemu = NULL;
+    while (i < parallel_qemu_num) {
+        if(tarQemuPid == allQemus[i].pid){
+            done_qemu = &allQemus[i];
+            break;
+        }
+        i++;
+    }
+    assert(done_qemu && "Cannot find target QEMU?");
+    if(done_qemu->start_us){ // not the first run
+        done_qemu->stop_us = get_cur_time_us();
+    }
+    check_qemu_tracebits(done_qemu);
+    do_extra_handles(done_qemu);
+    // after check, set ready share memory as initial state.
+    //SegSynchronization_acquire(SS);
+    //INIT_READYSHM(readyshm);
+    //SegSynchronization_release(SS);
+    done_qemu->isfree = 1; // Mark this qemu as a free one
+    done_qemu->cur_queue = NULL;
+    SegSynchronization_release(SS);
+    //show_stats();
+    //OKF("end onetestdone.");
+    return;
+}
+
 /* Handle timeout (SIGALRM). */
 
 static void handle_timeout(int sig) {
@@ -6612,6 +6890,7 @@ static void handle_timeout(int sig) {
   }
 
 }
+
 
 
 /* Do a PATH search and find target binary to see that it exists and
@@ -6863,8 +7142,12 @@ static void usage(u8* argv0) {
        "  -f file       - location read by the fuzzed program (stdin)\n"
        "  -t msec       - timeout for each run (auto-scaled, 50-%u ms)\n"
        "  -m megs       - memory limit for child process (%u MB)\n"
-       "  -Q            - use binary-only instrumentation (QEMU mode)\n\n"     
- 
+       "  -Q            - use binary-only instrumentation (QEMU mode)\n"
+#ifdef CONFIG_S2E
+       "  -P number     - specify how many parallel QEMU instances want to be started\n\n"
+#else
+       "\n"
+#endif
        "Fuzzing behavior settings:\n\n"
 
        "  -d            - quick & dirty mode (skips deterministic steps)\n"
@@ -7376,6 +7659,12 @@ static void setup_signal_handlers(void) {
   sigaction(SIGTSTP, &sa, NULL);
   sigaction(SIGPIPE, &sa, NULL);
 
+#ifdef CONFIG_S2E
+  /* SIGUSR2: One test is done on qemu side. */
+  sa.sa_handler = handle_onetestdone;
+  sigaction(SIGUSR2, &sa, NULL);
+#endif
+
 }
 
 
@@ -7485,17 +7774,19 @@ int main(int argc, char** argv) {
   u32 sync_interval_cnt = 0, seek_to;
   u8  *extras_dir = 0;
   u8  mem_limit_given = 0;
-
-  //no_forkserver = 1;
-
+#ifdef CONFIG_S2E
+  no_forkserver = 1; // Has no need to set forkserver in S2E mode.
+#endif
   char** use_argv;
 
   SAYF(cCYA "afl-fuzz " cBRI VERSION cRST " by <lcamtuf@google.com>\n");
 
   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
-
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
-
+#ifdef CONFIG_S2E
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QP:")) > 0) // Add -P(int): Number of parallel QEMU instances
+#else
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q:")) > 0)
+#endif
     switch (opt) {
 
       case 'i':
@@ -7645,7 +7936,14 @@ int main(int argc, char** argv) {
         if (!mem_limit_given) mem_limit = MEM_LIMIT_QEMU;
 
         break;
+#ifdef CONFIG_S2E
+      case 'P': /* Parallel qemu instances, default to 1 */
 
+        if( atoi(optarg) > 255 )
+            FATAL("Parallel qemu instances cannot be over than 255.");
+        parallel_qemu_num = atoi(optarg);
+        break;
+#endif
       default:
 
         usage(argv[0]);
@@ -7692,10 +7990,15 @@ int main(int argc, char** argv) {
   check_cpu_governor();
 
   setup_post();
+
   setup_shm();
 #ifdef CONFIG_S2E
-  if (in_bitmap) read_bitmap(in_bitmap);
+  PARAL_QEMU(SetupSHM4Ready)();
+  PARAL_QEMU(InitQemuQueue)();
+  // Let qemus to create the trace bits bitmap share memory.
+  PARAL_QEMU(setupTracebits)();
 #endif
+  if (in_bitmap) read_bitmap(in_bitmap);
 
 
   setup_dirs_fds();
@@ -7713,24 +8016,7 @@ int main(int argc, char** argv) {
 
   if (!out_file) setup_stdio_file();
 
-#ifdef CONFIG_S2E
-  no_forkserver    = 1;
-  init_S2EAFL_synPipe();
-  // then start S2E
-  s2e_pid = fork();
-
-    if (s2e_pid < 0) PFATAL("fork() failed");
-
-    if (!s2e_pid) {
-      system("/home/epeius/work/DSlab.EPFL/FinalSubmitV2/s2ebuild/qemu-release/i386-s2e-softmmu/qemu-system-i386 "
-              "-m 128 -net none -usbdevice tablet -monitor stdio "
-              "-hda /home/epeius/work/DSlab.EPFL/FinalTest/s2ebuild/images/debian.raw.s2e "
-              "-loadvm forkstate -s2e-config-file forkstate.lua");
-      return 1;
-    }
-  sleep(20);
-  OKF("TSTTTTTTTTTTTTTTTT.");
-#else
+#ifndef CONFIG_S2E
   check_binary(argv[optind]); // we don't want to check it in S2E mode
 #endif
   start_time = get_cur_time();
@@ -7740,7 +8026,12 @@ int main(int argc, char** argv) {
   else
     use_argv = argv + optind;
 
+#ifdef CONFIG_S2E
+  g_argv = use_argv;
+#endif
   perform_dry_run(use_argv);
+
+  // TODO: Cull should not start before all qemus is free.
 
   cull_queue();
 
@@ -7809,7 +8100,7 @@ int main(int argc, char** argv) {
     }
 
     skipped_fuzz = fuzz_one(use_argv);
-
+    break;
     if (!stop_soon && sync_id && !skipped_fuzz) {
       
       if (!(sync_interval_cnt++ % SYNC_INTERVAL))
@@ -7821,6 +8112,11 @@ int main(int argc, char** argv) {
 
     queue_cur = queue_cur->next;
     current_entry++;
+
+#ifdef CONFIG_S2E
+  /* Do not start a new cycle until all qemus are free and ready */
+  WAIT_ALLQEMUS_FREE
+#endif
 
   }
 
