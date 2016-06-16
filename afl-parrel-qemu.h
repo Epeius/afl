@@ -25,28 +25,12 @@
 // Share memory ID
 #define READYSHMID 1234
 
-// Share memory structure, used to transmit information
-typedef struct _readyShm
-{
-    u8  writable_mask;      // mask, non-zero means writable, zero means readable, used for simple synchronization?
-    u32 pid;                // Information: tells which qemu is done.
-    u8  fault;              // Executation fault like FAULT_CRASH
-}ReadyShm;
-
-// Initial the ready share memory
-#define INIT_READYSHM(_x) \
-    do { \
-        _x->writable_mask = 1; \
-        _x->pid = 0; \
-        _x->fault = 0; \
-    } while(0);
-
 // Wait for all the qemus until they are all free
 #define WAIT_ALLQEMUS_FREE \
       do { \
         int i = 0; \
         while (i < parallel_qemu_num) { \
-            if(allQemus[i].isfree) \
+            if(ReadArray[allQemus[i].pid]) \
                 i++; \
             else{ \
                 i = 0; \
@@ -76,10 +60,12 @@ typedef struct qemuInstance{
     u64         stop_us;        /* Stop time of a test (us)             */
     u8*         out_file;       /* Out file in memory (free it in time) */
     u32         len;            /* Length of out file                   */
-    u8          isfree;         /* Whether this qemu instance is free   */
+    u8          handled;        /* Whether has been handled manually    */
     void*       cur_queue;      /* Current queue file in all queues     */
     u8          cur_stage;      /* Which stage we are in                */
+    u8          fault;          /* Fault type                           */
 }QemuInstance;
+
 
 // Set up ready share memory for qemu and afl.
 void PARAL_QEMU(SetupSHM4Ready)(void);

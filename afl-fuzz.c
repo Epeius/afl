@@ -45,6 +45,11 @@
 #include <termios.h>
 #include <dlfcn.h>
 
+#ifdef CONFIG_S2E
+#include <assert.h> // for assert
+#endif
+
+
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/shm.h>
@@ -106,9 +111,8 @@ u8              parallel_qemu_num = 1;     /* How many qemu instances parallel *
 QemuInstance*   allQemus;                  /* Collection of all qemu instances */
 QemuInstance*   curQemu;                   /* Current free qemu instance       */
 u32             qemu_quene_fd;             /* Fd of qemu queue as FIFO         */
-ReadyShm*       readyshm;                  /* Ready share memory of qemu       */
-struct SegSynchronizationWrapper* SS;
 char**          g_argv;                    /* Shadow of user-argv              */
+u8*             ReadArray;                 /* An shared array for ready qemus  */
 #endif
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
@@ -747,6 +751,10 @@ static void read_bitmap(u8* fname) {
 
 static inline u8 has_new_bits(u8* virgin_map) {
 
+#ifdef CONFIG_S2E
+    assert(curQemu && "Done qemu is NULL?");
+#endif
+
 #ifdef __x86_64__
 #ifdef CONFIG_S2E
   u64* current = (u64*)(curQemu->trace_bits);
@@ -829,7 +837,6 @@ static inline u8 has_new_bits(u8* virgin_map) {
   }
 
   if (ret && virgin_map == virgin_bits) bitmap_changed = 1;
-
   return ret;
 
 }
@@ -2174,27 +2181,6 @@ static void init_forkserver(char** argv) {
 
 }
 
-#ifdef CONFIG_S2E
-static void init_S2EAFL_synPipe(void) {
-    // create Pipe and duplicate it
-    int s2e_side_pipe[2], afl_side_pipe[2];
-    if (pipe(s2e_side_pipe) || pipe(afl_side_pipe)){
-        PFATAL("pipe() failed");
-    }
-    if (dup2(s2e_side_pipe[1], AFLS2EHOSTPIPE_S2E + 1) < 0 || dup2(s2e_side_pipe[0], AFLS2EHOSTPIPE_S2E) < 0){
-        PFATAL("dup2() failed");
-    }
-
-    if (dup2(afl_side_pipe[1], AFLS2EHOSTPIPE_AFL + 1) < 0 || dup2(afl_side_pipe[0], AFLS2EHOSTPIPE_AFL) < 0){
-        PFATAL("dup2() failed");
-    }
-
-    S2EAFLsyn_S2E_fd = s2e_side_pipe[0]; // afl read s2e's pipe from 0 end point
-    S2EAFLsyn_AFL_fd = afl_side_pipe[1]; // afl write its pipe from 1 end point
-    OKF("All right - s2e and afl's pipes are up.");
-}
-#endif
-
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 static u8 run_target(char** argv) {
@@ -2235,7 +2221,8 @@ static u8 run_target(char** argv) {
       tmp[2] = 'd';
       tmp[3] = 't';
       curQemu->start_us = get_cur_time_us();
-      curQemu->isfree = 0;
+      ReadArray[curQemu->pid] = 0;
+      curQemu->handled = 0;
      if ((res = write(CTRLPIPE(curQemu->pid) + 1, &tmp, 4)) != 4) {
 
        if (stop_soon) return 0;
@@ -2419,6 +2406,119 @@ static u8 run_target(char** argv) {
   return FAULT_NONE;
 
 }
+static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault);
+static void check_qemu_tracebits(QemuInstance* qemu)
+{
+    // avoid compiler accesses registers and cache.
+    MEM_BARRIER();
+
+    if (qemu->cur_queue) { // FIXME: calibration ? Only do calibration once at perform_dry_run.
+        struct queue_entry* _cur = (struct queue_entry*) (qemu->cur_queue);
+        total_cal_us += qemu->stop_us - qemu->start_us;
+        total_cal_cycles += 1;
+
+        /* OK, let's collect some stats about the performance of this test case.
+         This is used for fuzzing air time calculations in calculate_score(). */
+
+        _cur->exec_us = (qemu->stop_us - qemu->start_us);
+        _cur->bitmap_size = count_bytes(qemu->trace_bits);
+        _cur->handicap = 0;
+        _cur->cal_failed = 0;
+        _cur->exec_cksum = hash32(qemu->trace_bits, MAP_SIZE, HASH_CONST);
+        total_bitmap_size += _cur->bitmap_size;
+        total_bitmap_entries++;
+
+        update_bitmap_score(_cur);
+    } else {
+
+        // set the loop bucket
+#ifdef __x86_64__
+        classify_counts((u64*)qemu->trace_bits);
+#else
+        classify_counts((u32*) qemu->trace_bits);
+#endif /* ^__x86_64__ */
+        u8 res = save_if_interesting(g_argv, (qemu->out_file), (qemu->len), qemu->fault);
+        queued_discovered += res;
+        /*
+        char oldname[128] = {0};
+        sprintf(oldname, "/tmp/afltraceBB/%d.BB", qemu->pid);
+        char newname[128] = {0};
+        sprintf(newname, "/tmp/afltraceBB/%d.BB", queued_discovered);
+        if(res){
+            FILE *fpSrc, *fpDest;  //定义两个指向文件的指针
+            fpSrc = fopen(oldname, "rb");    //以读取二进制的方式打开源文件
+            if(fpSrc==NULL){
+                printf( "Source file open failure.");  //源文件不存在的时候提示错误
+                exit(-1);
+            }
+            fpDest = fopen(newname, "wb");  // //以写入二进制的方式打开目标文件
+            if(fpDest==NULL){
+                printf("Destination file open failure.");
+                exit(-1);
+            }
+            int c;
+            while((c=fgetc(fpSrc))!=EOF){   //从源文件中读取数据知道结尾
+                fputc(c, fpDest);
+            }
+            fclose(fpSrc);  //关闭文件指针，释放内存
+            fclose(fpDest);
+        }
+        remove(oldname);
+        */
+    }
+    if (qemu->out_file) {
+        free(qemu->out_file); // avoid memory leak
+        qemu->out_file = NULL;
+    }
+    qemu->len = 0;
+    qemu->cur_queue = NULL;
+}
+
+static void do_extra_handles(QemuInstance* qemu)
+{
+    switch (qemu->cur_stage) {
+        case STAGE_CALIBRATE:
+            break;
+        case STAGE_INITIAL:
+            if (!sync_id)
+                assert(0 && "Do not try initial stage in single fuzzer mode.");
+            break;
+        case STAGE_FLIP1:
+        case STAGE_FLIP2:
+        case STAGE_FLIP4:
+        case STAGE_FLIP8:
+        case STAGE_FLIP16:
+        case STAGE_FLIP32:
+        case STAGE_ARITH8:
+        case STAGE_ARITH16:
+        case STAGE_ARITH32:
+        case STAGE_INTEREST8:
+        case STAGE_INTEREST16:
+        case STAGE_INTEREST32:
+        case STAGE_EXTRAS_UO:
+        case STAGE_EXTRAS_UI:
+        case STAGE_EXTRAS_AO:
+        case STAGE_HAVOC:
+        case STAGE_SPLICE:
+            break;
+        default:
+            assert(0 && "Cannot be here");
+            break;
+    }
+}
+/* Handle qemu's test done (SIGUSR2). */
+
+static void handle_onetestdone(QemuInstance* done_qemu) {
+    // See which qemu is done, this should be done in atom-mode.
+    //OKF("start onetestdone.");
+    check_qemu_tracebits(done_qemu);
+    do_extra_handles(done_qemu);
+    //done_qemu->isfree = 1; // Mark this qemu as a free one
+    done_qemu->cur_queue = NULL;
+    //show_stats();
+    //OKF("end onetestdone.");
+    return;
+}
 
 /* Write modified data to file for testing. If out_file is set, the old file
    is unlinked and a new one is created. Otherwise, out_fd is rewound and
@@ -2429,9 +2529,15 @@ static u8 run_target(char** argv) {
  *    test case directory.
  */
 
-#ifdef CONFIG_S2E
-#include <assert.h> // for assert
-#endif
+#define GETQUEUEITEM(_buffer, _pid, _fault, _exectime) \
+    do { \
+    char* token = strtok(_buffer, "|"); \
+    _pid        = atoi(token); \
+    token       = strtok(NULL, "|"); \
+    _fault      = atoi(token); \
+    token       = strtok(NULL, "|"); \
+    _exectime   = atol(token); \
+    }while(0)
 
 static void write_to_testcase(void* mem, u32 len, struct queue_entry* cur, u8 cur_stage) {
 
@@ -2441,13 +2547,16 @@ static void write_to_testcase(void* mem, u32 len, struct queue_entry* cur, u8 cu
 #ifdef CONFIG_S2E
   u8 buffer[FIFOBUFFERSIZE + 1];
   int tarQemuPid = 0;
+  u8 fault;
+  u64 execTime;
   while(!tarQemuPid){
       memset(buffer, '\0', sizeof(buffer));
       if(read(qemu_quene_fd, buffer, FIFOBUFFERSIZE) == -1)
           if(errno == EAGAIN) // try again
               continue;
           //PFATAL("Read from qemu_queue error, give up. Errno.%02d is: %s/n", errno, strerror(errno));
-      tarQemuPid = atoi(buffer);
+      GETQUEUEITEM(buffer, tarQemuPid, fault, execTime);
+      //tarQemuPid = atoi(buffer);
   }
   u8 i = 0;
   while (i < parallel_qemu_num) {
@@ -2458,11 +2567,15 @@ static void write_to_testcase(void* mem, u32 len, struct queue_entry* cur, u8 cu
       i++;
   }
   if(curQemu->start_us){ // not the first run
-      curQemu->stop_us = get_cur_time_us();
+      curQemu->stop_us = curQemu->start_us + execTime;
   }
   curQemu->cur_queue = cur;
   curQemu->cur_stage = cur_stage;
+  curQemu->fault = fault;
   assert(i < parallel_qemu_num && "Cannot find target qemu?");
+  if (curQemu->start_us && !curQemu->handled)
+      handle_onetestdone(curQemu);
+
   u8 tc_out_file[128];
   sprintf(tc_out_file, "%s%s", allQemus[i].testcaseDir, basename(out_file));
 #endif
@@ -2926,6 +3039,14 @@ static void perform_dry_run(char** argv) {
 #ifdef CONFIG_S2E
   /* wait until all qemus are free, which means all initial test cases are processed */
   WAIT_ALLQEMUS_FREE
+  u8 i = 0;
+  while (i < parallel_qemu_num){
+      if((allQemus + i)->start_us){
+          handle_onetestdone(allQemus + i);
+          (allQemus + i)->handled = 1;
+      }
+      i++;
+  }
 #endif
   OKF("All test cases processed.");
 
@@ -3351,46 +3472,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
 }
 
-static void check_qemu_tracebits(QemuInstance* qemu)
-{
-    // avoid compiler accesses registers and cache.
-    MEM_BARRIER();
 
-    if (qemu->cur_queue) { // FIXME: calibration ? Only do calibration once at perform_dry_run.
-        struct queue_entry* _cur = (struct queue_entry*) (qemu->cur_queue);
-        total_cal_us += qemu->stop_us - qemu->start_us;
-        total_cal_cycles += 1;
-
-        /* OK, let's collect some stats about the performance of this test case.
-         This is used for fuzzing air time calculations in calculate_score(). */
-
-        _cur->exec_us = (qemu->stop_us - qemu->start_us);
-        _cur->bitmap_size = count_bytes(qemu->trace_bits);
-        _cur->handicap = 0;
-        _cur->cal_failed = 0;
-        _cur->exec_cksum = hash32(qemu->trace_bits, MAP_SIZE, HASH_CONST);
-        total_bitmap_size += _cur->bitmap_size;
-        total_bitmap_entries++;
-
-        update_bitmap_score(_cur);
-    } else {
-
-        // set the loop bucket
-#ifdef __x86_64__
-        classify_counts((u64*)qemu->trace_bits);
-#else
-        classify_counts((u32*) qemu->trace_bits);
-#endif /* ^__x86_64__ */
-        queued_discovered += save_if_interesting(g_argv, (qemu->out_file),
-                (qemu->len), FAULT_NONE);
-    }
-    if (qemu->out_file) {
-        free(qemu->out_file); // avoid memory leak
-        qemu->out_file = NULL;
-    }
-    qemu->len = 0;
-    qemu->cur_queue = NULL;
-}
 
 /* When resuming, try to find the queue position to start from. This makes sense
    only when resuming, and when we can find the original fuzzer_stats. */
@@ -6786,39 +6868,6 @@ static void sync_fuzzers(char** argv) {
 
 }
 
-static void do_extra_handles(QemuInstance* qemu)
-{
-    switch (qemu->cur_stage) {
-        case STAGE_CALIBRATE:
-            break;
-        case STAGE_INITIAL:
-            if (!sync_id)
-                assert(0 && "Do not try initial stage in single fuzzer mode.");
-            break;
-        case STAGE_FLIP1:
-        case STAGE_FLIP2:
-        case STAGE_FLIP4:
-        case STAGE_FLIP8:
-        case STAGE_FLIP16:
-        case STAGE_FLIP32:
-        case STAGE_ARITH8:
-        case STAGE_ARITH16:
-        case STAGE_ARITH32:
-        case STAGE_INTEREST8:
-        case STAGE_INTEREST16:
-        case STAGE_INTEREST32:
-        case STAGE_EXTRAS_UO:
-        case STAGE_EXTRAS_UI:
-        case STAGE_EXTRAS_AO:
-        case STAGE_HAVOC:
-        case STAGE_SPLICE:
-            break;
-        default:
-            assert(0 && "Cannot be here");
-            break;
-    }
-}
-
 /* Handle stop signal (Ctrl-C, etc). */
 
 static void handle_stop_sig(int sig) {
@@ -6837,40 +6886,6 @@ static void handle_skipreq(int sig) {
 
   skip_requested = 1;
 
-}
-
-/* Handle qemu's test done (SIGUSR2). */
-
-static void handle_onetestdone(int sig) {
-    // See which qemu is done, this should be done in atom-mode.
-    //OKF("start onetestdone.");
-    SegSynchronization_acquire(SS);
-    int tarQemuPid = readyshm->pid;
-    u8 i = 0;
-    QemuInstance* done_qemu = NULL;
-    while (i < parallel_qemu_num) {
-        if(tarQemuPid == allQemus[i].pid){
-            done_qemu = &allQemus[i];
-            break;
-        }
-        i++;
-    }
-    assert(done_qemu && "Cannot find target QEMU?");
-    if(done_qemu->start_us){ // not the first run
-        done_qemu->stop_us = get_cur_time_us();
-    }
-    check_qemu_tracebits(done_qemu);
-    do_extra_handles(done_qemu);
-    // after check, set ready share memory as initial state.
-    //SegSynchronization_acquire(SS);
-    //INIT_READYSHM(readyshm);
-    //SegSynchronization_release(SS);
-    done_qemu->isfree = 1; // Mark this qemu as a free one
-    done_qemu->cur_queue = NULL;
-    SegSynchronization_release(SS);
-    //show_stats();
-    //OKF("end onetestdone.");
-    return;
 }
 
 /* Handle timeout (SIGALRM). */
@@ -7348,7 +7363,7 @@ static void check_crash_handling(void) {
   ACTF("Checking core_pattern...");
 
   if (read(fd, &fchar, 1) == 1 && fchar == '|') {
-
+/*
     SAYF("\n" cLRD "[-] " cRST
          "Hmm, your system is configured to send core dump notifications to an\n"
          "    external utility. This will cause issues due to an extended delay\n"
@@ -7362,7 +7377,7 @@ static void check_crash_handling(void) {
 
     if (!getenv("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES"))
       FATAL("Pipe at the beginning of 'core_pattern'");
-
+*/
   }
  
   close(fd);
@@ -7409,21 +7424,21 @@ static void check_cpu_governor(void) {
 
   if (min == max) return;
 
-  SAYF("\n" cLRD "[-] " cRST
-       "Whoops, your system uses on-demand CPU frequency scaling, adjusted\n"
-       "    between %llu and %llu MHz. Unfortunately, the scaling algorithm in the\n"
-       "    kernel is imperfect and can miss the short-lived processes spawned by\n"
-       "    afl-fuzz. To keep things moving, run these commands as root:\n\n"
-
-       "    cd /sys/devices/system/cpu\n"
-       "    echo performance | tee cpu*/cpufreq/scaling_governor\n\n"
-
-       "    You can later go back to the original state by replacing 'performance' with\n"
-       "    'ondemand'. If you don't want to change the settings, set AFL_SKIP_CPUFREQ\n"
-       "    to make afl-fuzz skip this check - but expect some performance drop.\n",
-       min / 1024, max / 1024);
-
-  FATAL("Suboptimal CPU scaling governor");
+//  SAYF("\n" cLRD "[-] " cRST
+//       "Whoops, your system uses on-demand CPU frequency scaling, adjusted\n"
+//       "    between %llu and %llu MHz. Unfortunately, the scaling algorithm in the\n"
+//       "    kernel is imperfect and can miss the short-lived processes spawned by\n"
+//       "    afl-fuzz. To keep things moving, run these commands as root:\n\n"
+//
+//       "    cd /sys/devices/system/cpu\n"
+//       "    echo performance | tee cpu*/cpufreq/scaling_governor\n\n"
+//
+//       "    You can later go back to the original state by replacing 'performance' with\n"
+//       "    'ondemand'. If you don't want to change the settings, set AFL_SKIP_CPUFREQ\n"
+//       "    to make afl-fuzz skip this check - but expect some performance drop.\n",
+//       min / 1024, max / 1024);
+//
+//  FATAL("Suboptimal CPU scaling governor");
 
 }
 
@@ -7658,12 +7673,6 @@ static void setup_signal_handlers(void) {
   sa.sa_handler = SIG_IGN;
   sigaction(SIGTSTP, &sa, NULL);
   sigaction(SIGPIPE, &sa, NULL);
-
-#ifdef CONFIG_S2E
-  /* SIGUSR2: One test is done on qemu side. */
-  sa.sa_handler = handle_onetestdone;
-  sigaction(SIGUSR2, &sa, NULL);
-#endif
 
 }
 
@@ -8100,7 +8109,7 @@ int main(int argc, char** argv) {
     }
 
     skipped_fuzz = fuzz_one(use_argv);
-    break;
+
     if (!stop_soon && sync_id && !skipped_fuzz) {
       
       if (!(sync_interval_cnt++ % SYNC_INTERVAL))

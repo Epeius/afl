@@ -67,8 +67,7 @@
 extern u8 parallel_qemu_num;
 extern QemuInstance * allQemus;
 extern u32 qemu_quene_fd;
-extern ReadyShm* readyshm;
-extern struct SegSynchronizationWrapper* SS;
+extern u8* ReadArray;
 //extern variable end
 
 #define QEMUEXECUTABLE "/home/epeius/work/DSlab.EPFL/FinalSubmitV2/s2ebuild/qemu-release/i386-s2e-softmmu/qemu-system-i386"
@@ -81,7 +80,7 @@ char *const qemu_argv[] ={"qemu-system-i386",
         "-loadvm", "forkstate",
         "-s2e-config-file", "/home/epeius/work/DSlab.EPFL/FinalSubmitV2/testplace/forkstate.lua",
         NULL};
-
+        
 /*
  * Set up share memory, which could be used for qemu to inform AFL that a test has done.
  * readyshm is handled in signal's handler.
@@ -90,7 +89,7 @@ void PARAL_QEMU(SetupSHM4Ready)(void)
 {
     void *shm = NULL;
     int shmid;
-    shmid = shmget((key_t) READYSHMID, sizeof(ReadyShm), 0666 | IPC_CREAT);
+    shmid = shmget((key_t) READYSHMID, sizeof(u8)*65536, 0666 | IPC_CREAT);
     if (shmid == -1) {
         fprintf(stderr, "shmget failed\n");
         exit(EXIT_FAILURE);
@@ -99,13 +98,7 @@ void PARAL_QEMU(SetupSHM4Ready)(void)
     if (shm == (void*) -1)
         PFATAL("shmat() failed");
     OKF("Ready share memory attached at %X.\n", (int) shm);
-    readyshm = (ReadyShm*) shm;
-    // initialization
-    SS = SegSynchronizationWrapper_GetInstance();
-    SegSynchronization_initsem(SS, SMKEY);
-    SegSynchronization_acquire(SS);
-    INIT_READYSHM(readyshm);
-    SegSynchronization_release(SS);
+    ReadArray = (u8*) shm;
 }
 /*
  * We don't create bitmap here because we cannot synchonize well with qemu, so give this chance to qemus.
@@ -149,7 +142,8 @@ void PARAL_QEMU(InitQemuQueue)(void)
             allQemus[i].pid = pid;
             allQemus[i].start_us = 0;
             allQemus[i].stop_us = 0;
-            allQemus[i].isfree = 1;
+            allQemus[i].handled = 0;
+            ReadArray[pid] = 1;
             allQemus[i].cur_queue = NULL;
             allQemus[i].cur_stage = 18; // Initial stage
             u8* _tcDir = (u8*) malloc(128);
