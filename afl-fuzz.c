@@ -113,6 +113,8 @@ QemuInstance*   curQemu;                   /* Current free qemu instance       *
 u32             qemu_quene_fd;             /* Fd of qemu queue as FIFO         */
 char**          g_argv;                    /* Shadow of user-argv              */
 u8*             ReadArray;                 /* An shared array for ready qemus  */
+static u8       use_stuckhelper;          /* Whether do we need a stuck helper*/
+u8*             stuck_helper_dir;          /* Pid for fuzzy stuck helper       */
 #endif
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
@@ -120,10 +122,7 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_null_fd = -1,          /* Persistent fd for /dev/null      */
            fsrv_ctl_fd,               /* Fork server control pipe (write) */
            fsrv_st_fd;                /* Fork server status pipe (read)   */
-#ifdef CONFIG_S2E
-static s32 S2EAFLsyn_S2E_fd,          /* S2E write pipe */
-           S2EAFLsyn_AFL_fd;          /* AFL write pipe */
-#endif
+
 
 static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
@@ -2223,7 +2222,7 @@ static u8 run_target(char** argv) {
       curQemu->start_us = get_cur_time_us();
       ReadArray[curQemu->pid] = 0;
       curQemu->handled = 0;
-     if ((res = write(CTRLPIPE(curQemu->pid) + 1, &tmp, 4)) != 4) {
+     if ((res = write(CTRLPIPE(curQemu->pid) + 1, tmp, 4)) != 4) {
 
        if (stop_soon) return 0;
        RPFATAL(res, "Unable to tell our friend S2E, oohhhh (OOM?)");
@@ -3038,7 +3037,7 @@ static void perform_dry_run(char** argv) {
 
 #ifdef CONFIG_S2E
   /* wait until all qemus are free, which means all initial test cases are processed */
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   u8 i = 0;
   while (i < parallel_qemu_num){
       if((allQemus + i)->start_us){
@@ -5289,7 +5288,7 @@ static u8 fuzz_one(char** argv) {
 #endif
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
 #endif
   new_hit_cnt = queued_paths + unique_crashes;
 
@@ -5322,7 +5321,7 @@ static u8 fuzz_one(char** argv) {
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
 #endif
   new_hit_cnt = queued_paths + unique_crashes;
 
@@ -5355,7 +5354,7 @@ static u8 fuzz_one(char** argv) {
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_FLIP4]  += new_hit_cnt - orig_hit_cnt;
@@ -5453,7 +5452,7 @@ static u8 fuzz_one(char** argv) {
   stage_finds[STAGE_FLIP8]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP8] += stage_max;
 #else
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   stage_cycles[STAGE_FLIP8] += stage_max;
 #endif
   /* Two walking bytes. */
@@ -5493,7 +5492,7 @@ static u8 fuzz_one(char** argv) {
   stage_finds[STAGE_FLIP16]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP16] += stage_max;
 #else
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   stage_cycles[STAGE_FLIP16] += stage_max;
 #endif
   if (len < 4) goto skip_bitflip;
@@ -5527,7 +5526,7 @@ static u8 fuzz_one(char** argv) {
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_FLIP32]  += new_hit_cnt - orig_hit_cnt;
@@ -5599,7 +5598,7 @@ skip_bitflip:
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_ARITH8]  += new_hit_cnt - orig_hit_cnt;
@@ -5694,7 +5693,7 @@ skip_bitflip:
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_ARITH16]  += new_hit_cnt - orig_hit_cnt;
@@ -5787,7 +5786,7 @@ skip_bitflip:
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_ARITH32]  += new_hit_cnt - orig_hit_cnt;
@@ -5845,7 +5844,7 @@ skip_arith:
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_INTEREST8]  += new_hit_cnt - orig_hit_cnt;
@@ -5914,7 +5913,7 @@ skip_arith:
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_INTEREST16]  += new_hit_cnt - orig_hit_cnt;
@@ -5984,7 +5983,7 @@ skip_arith:
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_INTEREST32]  += new_hit_cnt - orig_hit_cnt;
@@ -6051,7 +6050,7 @@ skip_interest:
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_EXTRAS_UO]  += new_hit_cnt - orig_hit_cnt;
@@ -6096,7 +6095,7 @@ skip_interest:
 
   ck_free(ex_tmp);
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_EXTRAS_UI]  += new_hit_cnt - orig_hit_cnt;
@@ -6148,7 +6147,7 @@ skip_user_extras:
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_EXTRAS_AO]  += new_hit_cnt - orig_hit_cnt;
@@ -6605,7 +6604,7 @@ havoc_stage:
 
   }
 #ifdef CONFIG_S2E
-  WAIT_ALLQEMUS_FREE
+  WAIT_ALLQEMUS_FREE;
   new_hit_cnt = queued_paths + unique_crashes;
 
   if (!splice_cycle) {
@@ -7772,8 +7771,76 @@ static void save_cmdline(u32 argc, char** argv) {
   *buf = 0;
 
 }
+#ifdef CONFIG_S2E
+static void feed_fuzzy_stuck_helper()
+{
+    /* Map the test case into memory. */
+    s32 fd, len, stuck_fd;
+    u8  *orig_in, *in_buf, *out_buf;
+    fd = open(queue_cur->fname, O_RDONLY);
 
+    if (fd < 0) PFATAL("Unable to open '%s'", queue_cur->fname);
 
+    len = queue_cur->len;
+
+    orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+
+    if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", queue_cur->fname);
+
+    close(fd);
+
+    out_buf = ck_alloc_nozero(len);
+    memcpy(out_buf, in_buf, len);
+    // write current testcase to stuck helper's testcase directory
+    u8 tc_out_file[128];
+    sprintf(tc_out_file, "%s%s", stuck_helper_dir, basename(out_file));
+    if (out_file) {
+        unlink(tc_out_file);
+    }
+    stuck_fd = open(tc_out_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (stuck_fd < 0)
+        PFATAL("Unable to create '%s'", tc_out_file);
+    ck_write(stuck_fd, out_buf, len, tc_out_file);
+    if (!out_file) {
+        if (ftruncate(stuck_fd, len))
+            PFATAL("ftruncate() failed");
+        lseek(stuck_fd, 0, SEEK_SET);
+    } else
+        close(stuck_fd);
+
+    // tell stuck helper to start
+    s32 res;
+    char tmp[4];
+    tmp[0] = 'n';
+    tmp[1] = 'u';
+    tmp[2] = 'd';
+    tmp[3] = 't';
+    if ((res = write(AFLCTRLPIPE + 1, tmp, 4)) != 4)
+        RPFATAL(res, "Unable to tell our friend fuzzy stuck helper, oohhhh (OOM?)");
+    else
+        OKF("[+] Invoke fuzzy stuck helper to avoid getting stuck.");
+    // clean
+    munmap(orig_in, queue_cur->len);
+
+    if (in_buf != orig_in) ck_free(in_buf);
+    ck_free(out_buf);
+
+    // wait our friend's work is done
+    u8 err[128];
+    res = 0;
+    do{
+        res = read(S2ECTRLPIPE, tmp, 4);
+        if(res == -1){
+            if(errno == EINTR) // this may be interrupted
+                continue;
+            break;
+        }else
+            break;
+
+    } while(1);
+}
+
+#endif
 /* Main entry point */
 
 int main(int argc, char** argv) {
@@ -7792,7 +7859,7 @@ int main(int argc, char** argv) {
 
   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
 #ifdef CONFIG_S2E
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QP:")) > 0) // Add -P(int): Number of parallel QEMU instances
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QP:H")) > 0) // Add -P(int): Number of parallel QEMU instances, -H means use stuckhelper
 #else
   while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q:")) > 0)
 #endif
@@ -7896,6 +7963,10 @@ int main(int argc, char** argv) {
         skip_deterministic = 1;
         use_splicing = 1;
         break;
+
+      case 'H':
+          use_stuckhelper = 1;
+          break;
 
       case 'B':
 
@@ -8004,6 +8075,8 @@ int main(int argc, char** argv) {
 #ifdef CONFIG_S2E
   PARAL_QEMU(SetupSHM4Ready)();
   PARAL_QEMU(InitQemuQueue)();
+  if(use_stuckhelper)
+      PARAL_QEMU(InitStuckHelper)();
   // Let qemus to create the trace bits bitmap share memory.
   PARAL_QEMU(setupTracebits)();
 #endif
@@ -8040,8 +8113,6 @@ int main(int argc, char** argv) {
 #endif
   perform_dry_run(use_argv);
 
-  // TODO: Cull should not start before all qemus is free.
-
   cull_queue();
 
   show_init_stats();
@@ -8065,10 +8136,10 @@ int main(int argc, char** argv) {
 
     u8 skipped_fuzz;
 #ifdef CONFIG_S2E
-    if(0){
-        read_testcases();
-        pivot_inputs();
-    }
+
+    read_testcases();
+    pivot_inputs();
+
 #endif
     cull_queue();
 
@@ -8119,13 +8190,21 @@ int main(int argc, char** argv) {
 
     if (stop_soon) break;
 
+#ifdef CONFIG_S2E
+  /* Do not start a new cycle until all qemus are free and ready */
+  WAIT_ALLQEMUS_FREE;
+  // Once all qemus are free, check how many new paths are found, if less \
+       than predefined, then call fuzzy_stuck_helper to save us.
+  if(use_stuckhelper){
+      //if (queued_paths == prev_queued)
+      feed_fuzzy_stuck_helper();
+  }
+
+#endif
+
     queue_cur = queue_cur->next;
     current_entry++;
 
-#ifdef CONFIG_S2E
-  /* Do not start a new cycle until all qemus are free and ready */
-  WAIT_ALLQEMUS_FREE
-#endif
 
   }
 

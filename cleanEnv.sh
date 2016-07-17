@@ -23,6 +23,6 @@ rm -rf /tmp/afltracebits/*
 
 rm -f /tmp/afl_qemu_queue
 
-cp /home/epeius/work/afl-1.96b/tests/plot/aa-00.jpeg /home/epeius/work/afl-1.96b/tests/seed/aa.jpeg
+cp /home/epeius/work/afl-1.96b/tests/plot/aa.jpeg /home/epeius/work/afl-1.96b/tests/seed/aa.jpeg
 
 rm -rf /home/epeius/work/afl-1.96b/tests/output/*

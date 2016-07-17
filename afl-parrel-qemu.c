@@ -68,6 +68,7 @@ extern u8 parallel_qemu_num;
 extern QemuInstance * allQemus;
 extern u32 qemu_quene_fd;
 extern u8* ReadArray;
+extern pid_t stuck_helper_dir;
 //extern variable end
 
 #define QEMUEXECUTABLE "/home/epeius/work/DSlab.EPFL/FinalSubmitV2/s2ebuild/qemu-release/i386-s2e-softmmu/qemu-system-i386"
@@ -79,6 +80,16 @@ char *const qemu_argv[] ={"qemu-system-i386",
         "-hda", "/home/epeius/work/DSlab.EPFL/FinalTest/s2ebuild/images/debian.raw.s2e",
         "-loadvm", "forkstate",
         "-s2e-config-file", "/home/epeius/work/DSlab.EPFL/FinalSubmitV2/testplace/forkstate.lua",
+        NULL};
+
+char *const stuckhelper_argv[] ={"qemu-system-i386",
+        "-m", "128",
+        "-net", "none",
+        "-usbdevice", "tablet",
+        "-monitor", "stdio",
+        "-hda", "/home/epeius/work/DSlab.EPFL/FinalTest/s2ebuild/images/debian.raw.s2e",
+        "-loadvm", "forkstate_stuck_helper",
+        "-s2e-config-file", "/home/epeius/work/DSlab.EPFL/FinalSubmitV2/testplace/forkstate_stuck_helper.lua",
         NULL};
         
 /*
@@ -157,6 +168,37 @@ void PARAL_QEMU(InitQemuQueue)(void)
             allQemus[i].ctrl_pipe = CTRLPIPE(pid) + 1;
         }
         i++;
+        sleep(10); // why not sleep for a while.
+    }
+}
+
+void PARAL_QEMU(InitStuckHelper)(void)
+{
+    int s2e_w_fd[2]; // for s2e write
+    int afl_w_fd[2]; // for afl write
+    if(pipe(s2e_w_fd)!=0)
+        PFATAL("pipe() for s2e failed");
+    if(pipe(afl_w_fd)!=0)
+        PFATAL("pipe() for afl failed");
+
+    if (dup2(s2e_w_fd[1], S2ECTRLPIPE + 1) < 0 || dup2(s2e_w_fd[0], S2ECTRLPIPE) < 0)
+        PFATAL("dup2() for s2e failed");
+    if (dup2(afl_w_fd[1], AFLCTRLPIPE + 1) < 0 || dup2(afl_w_fd[0], AFLCTRLPIPE) < 0)
+        PFATAL("dup2() for afl failed");
+    pid_t pid = fork();
+    if (pid < 0)
+        PFATAL("fork() failed");
+    if (!pid) {
+        // start stuck helper
+        execv(QEMUEXECUTABLE, stuckhelper_argv);
+    } else {
+        // more jobs
+        OKF("[+] Starting stuck helper...");
+        u8* _tcDir = (u8*) malloc(128);
+        sprintf(_tcDir, "/tmp/afltestcase/%d/", pid);
+        if(access(_tcDir, F_OK))
+            mkdir(_tcDir, 0777);
+        stuck_helper_dir = _tcDir;
         sleep(10); // why not sleep for a while.
     }
 }

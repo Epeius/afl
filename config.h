@@ -294,8 +294,8 @@
 /* Pipe to synchronize S2E and AFL
  */
 #ifdef CONFIG_S2E
-#define AFLS2EHOSTPIPE_S2E 137 // pipe used to synchronize myself and S2E (for S2E write)
-#define AFLS2EHOSTPIPE_AFL 147 // pipe used to synchronize myself and S2E (for AFL write)
+#define S2ECTRLPIPE 106 // pipe used to synchronize myself and S2E (for S2E write)
+#define AFLCTRLPIPE 160 // pipe used to synchronize myself and S2E (for AFL write)
 #endif
 
 

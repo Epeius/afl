@@ -37,7 +37,7 @@
                 sleep(0.001); \
             } \
         } \
-      }while(0);
+      }while(0)
 
 // Every control pipe
 /*
